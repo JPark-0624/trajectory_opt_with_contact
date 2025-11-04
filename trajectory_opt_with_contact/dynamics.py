@@ -176,3 +176,61 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     loss = goal_term + ctrl_term + pen_term + v_term + obs_term
     
     return loss, q, torch.stack(lambdas), torch.stack(phis), torch.stack(qs), torch.stack(qrobot_hist)
+
+def implicit_euler_defects(qk, vk, prk, uk,
+                           qk1, vk1, prk1,
+                           h, m, Izz, half, mu,
+                           qp_solver: ContactQPSolver,
+                           alpha_stab=0.1, eps_H=1e-4, device=None):
+    """
+    Compute dynamics residuals for implicit Euler transcription at a single knot.
+
+    Implicit scheme:
+      q_{k+1} = q_k + h * v_{k+1}
+      v_{k+1} = v_k + M^{-1} J(q_{k+1})^T λ_{k}  - 0.3*h*v_{k+1}      (damping)
+      pr_{k+1} = pr_k + h * u_k
+      λ_k solves contact QP at (q_{k+1}, v_{k+1}, pr_k, u_k)
+
+    Returns residual vector r concatenating [r_q, r_v, r_p] (shape (3+3+2,))
+    along with the λ_k and signed distance φ_k for logging.
+    """
+    if device is None:
+        device = qk.device
+
+    # Mass inverse
+    M_inv = torch.diag(torch.tensor([1.0/m, 1.0/m, 1.0/Izz], dtype=qk.dtype, device=device))
+
+    # Contact Jacobian and signed distance evaluated at the implicit state
+    J, n, t, c_world, phi = contact_frame_and_J(qk1, vk1, prk, half, mu)
+
+    # Delassus operator H = J M^-1 J^T + eps I
+    H = J @ M_inv @ J.T + eps_H * torch.eye(J.shape[0], dtype=qk.dtype, device=device)
+    L = torch.linalg.cholesky(H)
+
+    # Relative velocity in contact frame (implicit depends on v_{k+1})
+    v_push_proj = torch.stack([torch.dot(n, uk), torch.dot(t, uk)])
+
+    # b = J v_{k+1} - v_push_proj + Baumgarte(phi/h) on normal
+    b = (J @ vk1) - v_push_proj
+    if phi < 0.0:
+        b = b.clone()
+        b[0] = b[0] + alpha_stab * (phi / h)
+
+    lam = qp_solver.solve(L, b)
+
+    # Implicit velocity update residual r_v = 0
+    # vk1 ?= vk + M_inv J^T lam - 0.3*h*vk1
+    rhs_v = vk + (M_inv @ (J.T @ lam)) - 0.3 * h * vk1
+    r_v = vk1 - rhs_v
+
+    # Position residual r_q = 0: qk1 ?= qk + h*vk1
+    q_pred = torch.stack([qk[0] + h * vk1[0],
+                          qk[1] + h * vk1[1],
+                          qk[2] + h * vk1[2]])
+    r_q = qk1 - q_pred
+
+    # Pusher residual r_p = 0: prk1 ?= prk + h*uk
+    r_p = prk1 - (prk + h * uk)
+
+    r = torch.cat([r_q, r_v, r_p], dim=0)
+    return r, lam, phi
