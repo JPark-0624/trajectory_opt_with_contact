@@ -1,5 +1,5 @@
 import torch
-from .dynamics import implicit_euler_defects
+# from .dynamics import implicit_euler_defects
 from .qp_solver import ContactQPSolver
 
 class DirectTranscriptionOptimizer:
