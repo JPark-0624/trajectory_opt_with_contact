@@ -14,14 +14,25 @@ print("Trajectory Optimization with Visualization")
 print("="*60)
 
 # Create optimizer (matching original parameters)
+
+TO_solver = 'shooting'
+dynamics_solver = 'IP' #'LCP'
+obs = 'obs'
+
 print("\nCreating optimizer...")
 optimizer = TrajectoryOptimizer(
-    mass=1.0,
-    side_length=0.2,
-    mu=0.6,
-    horizon=60,
-    dt=0.05,
-    device='cuda' if torch.cuda.is_available() else 'cpu'
+    mass=1.0, side_length=0.2, mu=0.6,
+    horizon=30, dt=0.05,
+    device='cuda' if torch.cuda.is_available() else 'cpu',
+    TO_solver=TO_solver,
+    dynamics_solver=dynamics_solver, #'LCP',
+    # ALM params
+    use_second_order=True,         # LBFGS solver for Augmented Lagrangian
+    alm_enabled=True,
+    alm_rho_init=1e2,
+    alm_target_tol=1e-6,
+    alm_outer_iters=8,
+    lbfgs_inner_steps=10
 )
 
 print(f"Using device: {optimizer.device}")
@@ -31,7 +42,7 @@ q0 = [0.0, 0.0, 0.0]
 v0 = [0.0, 0.0, 0.0]
 pusher0 = [0.3, -0.3]
 goal = [-0.2, 0.5, -0.3]
-obstacle = None #[0.2, -0.2]  # Obstacle position from original code
+obstacle = [0.2, -0.2]  # Obstacle position from original code
 u_init = [[-0.2, 0.2]] * optimizer.horizon  # Initial guess from original code
 
 
@@ -47,10 +58,10 @@ result = optimizer.optimize(
     pusher0=pusher0,
     goal=goal,
     u_init=u_init,
-    max_iters=100,
-    lr=0.01,
+    max_iters= 100, #100,
+    lr=0.05,
     lr_decay_step=10,
-    lr_decay_gamma=0.5,
+    lr_decay_gamma=0.8,
     obstacle_pos=obstacle,
     verbose=True
 )
@@ -68,9 +79,9 @@ visualize_result(
     result, 
     goal, 
     half_size=optimizer.half,
-    save_trajectory='trajectory.png',
-    save_animation='animation.mp4',
-    save_analysis='analysis.png',
+    save_trajectory='trajectory' + TO_solver + dynamics_solver+ obs+'.png',
+    save_animation='animation'+ TO_solver + dynamics_solver+obs+  '.mp4',
+    save_analysis='analysis' + TO_solver + dynamics_solver+obs+ '.png',
     obstacle_pos=obstacle,
     xlim=(-1.0, 1.0),
     ylim=(-1.0, 1.0)

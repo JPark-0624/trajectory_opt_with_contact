@@ -14,12 +14,10 @@ class TrajectoryOptimizer:
     """
     def __init__(self, mass=1.0, side_length=0.2, mu=0.6,
                 horizon=60, dt=0.05, device='cuda',
-                use_transcription: bool = False, #True:transcription, #False: Shooting
-                use_second_order: bool = False, #TO solve with 1st order or 2nd order method
-                qp_backend: str = "cvxpy", #cvxpy or qpth (interior point)
-                ipm_eps: float = 1e-4,
-                ipm_max_iter: int = 50,
+                TO_solver: str = 'shooting', # or 'transcription"
+                dynamics_solver: str = 'LCP', #'IP' is interior point
                 # ALM knobs (forwarded to DirectTranscriptionOptimizer):
+                use_second_order: bool = False, #TO solve with 1st order or 2nd order method
                 alm_enabled: bool = True, alm_rho_init: float = 1e2, alm_rho_max: float = 1e8,
                 alm_eta: float = 10.0, alm_target_tol: float = 1e-6,
                 alm_outer_iters: int = 10, lbfgs_inner_steps: int = 10, lbfgs_history: int = 10):
@@ -36,24 +34,24 @@ class TrajectoryOptimizer:
             device = 'cpu'
         self.device = torch.device(device)
 
-        self.use_transcription = use_transcription
+        self.TO_solver = TO_solver
+        self.dynamics_solver = dynamics_solver
+
+        # ALM (Transcription) Option
         self.use_second_order = use_second_order
-        self.qp_backend = qp_backend
-        self.ipm_eps = ipm_eps
-        self.ipm_max_iter = ipm_max_iter
+        self.qp_solver = None 
+        if self.dynamics_solver == 'LCP':
+            # Low-level QP, build it here so that it doesn't need to be rebuilt
+            self.qp_solver = ContactQPSolver(mu=self.mu, n_contacts=1,
+                                            backend='cvxpy')
 
-        # Low-level QP (for shooting path); transcription will build its own
-        self.qp_solver = ContactQPSolver(mu=self.mu, n_contacts=1,
-                                         backend=self.qp_backend,
-                                         ipm_eps=self.ipm_eps,
-                                         ipm_max_iter=self.ipm_max_iter)
-
-        if self.use_transcription:
+        if self.TO_solver == 'transcription':
             self.trans = DirectTranscriptionOptimizer(
                 mass=self.m, side_length=self.side, mu=self.mu,
                 horizon=self.horizon, dt=self.dt, device=device,
                 use_second_order=self.use_second_order,
-                qp_backend=self.qp_backend, ipm_eps=self.ipm_eps, ipm_max_iter=self.ipm_max_iter,
+                dynamics_solver=self.dynamics_solver,
+                qp_solver = self.qp_solver, #only used for LCP dynamics solver
                 alm_enabled=alm_enabled, alm_rho_init=alm_rho_init, alm_rho_max=alm_rho_max,
                 alm_eta=alm_eta, alm_target_tol=alm_target_tol,
                 alm_outer_iters=alm_outer_iters, lbfgs_inner_steps=lbfgs_inner_steps,
@@ -72,7 +70,7 @@ class TrajectoryOptimizer:
                  u_init=None, max_iters=100, lr=0.01,
                  lr_decay_step=10, lr_decay_gamma=0.5,
                  obstacle_pos=None, verbose=True):
-        if self.use_transcription:
+        if self.TO_solver == 'transcription':
             return self.trans.optimize(
                 q0=q0, v0=v0, pusher0=pusher0, goal=goal,
                 u_init=u_init, max_iters=max_iters, lr=lr,
@@ -80,9 +78,9 @@ class TrajectoryOptimizer:
             )
 
         # ---- Original shooting pipeline (unchanged) ----
-        q0 = self._to_tensor(q0, requires_grad=False)
-        v0 = self._to_tensor(v0, requires_grad=False)
-        pusher0 = self._to_tensor(pusher0, requires_grad=False)
+        q0 = self._to_tensor(q0, requires_grad=True)
+        v0 = self._to_tensor(v0, requires_grad=True)
+        pusher0 = self._to_tensor(pusher0, requires_grad=True)
         goal = self._to_tensor(goal, requires_grad=False)
         if obstacle_pos is not None:
             obstacle_pos = self._to_tensor(obstacle_pos, requires_grad=False)
@@ -99,17 +97,28 @@ class TrajectoryOptimizer:
         from .dynamics import rollout
         for it in range(max_iters):
             opt.zero_grad()
-            loss, q_final, lambdas, phis, qs, pusher_traj = rollout(
+            print('-------------------------------------')
+            loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
                 u_seq, q0, v0, pusher0, self.horizon, self.dt,
                 self.m, self.Izz, self.half, self.mu, goal,
-                qp_solver=self.qp_solver, obstacle_pos=obstacle_pos,
+                qp_solver = self.qp_solver,
+                dynamics_solver=self.dynamics_solver, obstacle_pos=obstacle_pos,
                 device=self.device
             )
             loss.backward()
             opt.step()
             sched.step()
+            def to_scalar(x):
+                return x.item() if torch.is_tensor(x) else float(x)
             if verbose and (it+1) % 1 == 0:
-                print(f"[Shooting] Iter {it+1:3d} | Loss={loss.item():.4f} | Final x={q_final[0].item():.3f}")
+                print(f"[Shooting] Iter {it+1:3d} | "
+                    f"Total={to_scalar(loss):.4f} | "
+                    f"Goal={to_scalar(goal_term):.4f} | "
+                    f"Ctrl={to_scalar(ctrl_term):.6f} | "
+                    f"Vel={to_scalar(v_term):.4f} | "
+                    f"Obs={to_scalar(obs_term):.4f} | "
+                    f"Pen={to_scalar(pen_term):.4f} | "
+                    f"Final x={to_scalar(q_final[0]):.3f}")
 
         return {
             'loss': loss.item(),

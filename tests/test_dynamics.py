@@ -8,7 +8,7 @@ import os
 import numpy as np
 import time
 from trajectory_opt_with_contact import (
-    step_square, step_square_pos_ip, IPMOptions, rollout, ContactQPSolver, visualize_result,step_square_pos_ip_lin
+    step_square, step_square_pos_ip, IPMOptions, rollout, ContactQPSolver, visualize_result
 )
 
 
@@ -24,20 +24,26 @@ Izz = 1.0 / 6.0
 half = 0.1
 mu = 0.6
 h = 0.02
-horizon = 30 #100 #150
+horizon = 100 #100 #150
 
 # Initial state
+# q0 = torch.tensor([0.0, 0.0, 0.0], dtype=dtype, device=device)
+# v0 = torch.zeros(3, dtype=dtype, device=device)
+# pr0 = torch.tensor([0.0, -0.15], dtype=dtype, device=device)
+
 q0 = torch.tensor([0.0, 0.0, 0.0], dtype=dtype, device=device)
-v0 = torch.zeros(3, dtype=dtype, device=device)
-pr0 = torch.tensor([0.0, -0.15], dtype=dtype, device=device)
+v0 = torch.tensor([0.0, 0.0, 0.0], dtype=dtype, device=device)
+pr0 = torch.tensor([0.3, -0.25], dtype=dtype, device=device)
 
 # Goal state
 goal = torch.tensor([0.3, 0.0, 0.0], dtype=dtype, device=device)
 
 # Control sequence: constant push forward
-u_seq = torch.zeros(horizon, 2, dtype=dtype, device=device)
-u_seq[:, 1] = 0.25  # push upward along y
-u_seq[:, 0] = 0.05
+# u_seq = torch.zeros(horizon, 2, dtype=dtype, device=device)
+# u_seq[:, 1] = 0.25  # push upward along y
+# u_seq[:, 0] = 0.05
+
+u_seq = torch.tensor([[-0.2, 0.2]] * horizon, dtype=dtype, device=device)
 
 # Output directories
 os.makedirs("results", exist_ok=True)
@@ -48,14 +54,15 @@ os.makedirs("results", exist_ok=True)
 print("\n=== Running simulation with CVXPY solver ===")
 solver_cvx = ContactQPSolver(mu=mu, n_contacts=1, backend="cvxpy")
 
-loss_cvx, q_final_cvx, lam_hist_cvx, phi_hist_cvx, q_hist_cvx, pusher_hist_cvx = rollout(
-    u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal, qp_solver=solver_cvx, device=device
+loss_cvx, q_final_cvx, lam_hist_cvx, phi_hist_cvx, q_hist_cvx, pusher_hist_cvx,_,_,_,_,_ = rollout(
+    u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal, qp_solver=solver_cvx, dynamics_solver='LCP',
+    device=device
 )
 
 result_cvx = {
     "trajectory": q_hist_cvx.cpu().numpy(),
     "pusher_trajectory": pusher_hist_cvx.cpu().numpy(),
-    "contact_forces": lam_hist_cvx.cpu().numpy()/h,
+    "contact_forces": lam_hist_cvx.cpu().numpy(),
     "signed_distances": phi_hist_cvx.cpu().numpy(),
     "u_seq": u_seq.cpu().numpy(),
 }
@@ -75,7 +82,6 @@ visualize_result(
 # 3. Run simulation with interior point solver
 # ===========================================================
 print("\n=== Running simulation with IP solver ===")
-solver_ip = ContactQPSolver(mu=mu, n_contacts=1, backend="qpth")
 
 # We'll use the same rollout function but with step_square_ip inside
 qs_ip = [q0]
@@ -94,12 +100,11 @@ for k in range(horizon):
     q_next, v_next, pr_next, lam, phi = step_square_pos_ip(
        q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
        skip_solving_threshold = 0.3,
-        ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-4, smooth_sdf=50.0,
+        ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-4, smooth_sdf=5.0,
         enable_viscous_ground_friction=True,
-        c_lin=8.0,          
-        c_ang=8.0 * half     
+        c_lin=80.0,          
+        c_ang=80.0 * half     
         ))
-
     # q_next, v_next, pr_next, lam, phi = step_square_pos_ip_lin(
     #    q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
     #    skip_solving_threshold = 0.3,
@@ -120,7 +125,7 @@ print(f'Time elapsed: {time.time() - start_time}')
 
 result_ip = {
     "trajectory": torch.stack(qs_ip).detach().cpu().numpy(),
-    "pusher_trajectory": torch.stack(prs_ip).cpu().numpy(),
+    "pusher_trajectory": torch.stack(prs_ip).detach().cpu().numpy(),
     "contact_forces": torch.stack(lams_ip).detach().cpu().numpy(),
     "signed_distances": torch.tensor(phis_ip).cpu().numpy(),
     "u_seq": u_seq.detach().cpu().numpy(),

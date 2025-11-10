@@ -7,7 +7,7 @@ for planar manipulation tasks.
 
 from .qp_solver import ContactQPSolver
 from .geometry import rot, closest_point_on_square_and_normal, contact_frame_and_J
-from .dynamics import step_square, rollout, step_square_pos_ip, IPMOptions, step_square_pos_ip_lin
+from .dynamics import step_square, rollout, step_square_pos_ip, IPMOptions
 from .optimizer import TrajectoryOptimizer
 from .transcription import DirectTranscriptionOptimizer
 from .visualizer import TrajectoryVisualizer, visualize_result

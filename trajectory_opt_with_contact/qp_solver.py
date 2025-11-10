@@ -23,15 +23,11 @@ class ContactQPSolver:
     """
     
     def __init__(self, mu=0.6, n_contacts=1,
-                backend: str = "cvxpy",          # "cvxpy" or "qpth"
-                ipm_eps: float = 1e-4,           # target duality gap / accuracy for qpth
-                ipm_max_iter: int = 50):
+                backend: str = "cvxpy"):
         self.mu = mu
         self.n_contacts = n_contacts
         self.dim = 2 * n_contacts  # [λ_n, λ_t] per contact
         self.backend = backend
-        self.ipm_eps = ipm_eps
-        self.ipm_max_iter = ipm_max_iter
 
         # Build the QP problem
         self._build_qp()
@@ -68,10 +64,6 @@ class ContactQPSolver:
             # Create the problem and layer
             problem = cp.Problem(objective, constraints)
             self.qp_layer = CvxpyLayer(problem, parameters=[Q_param, b_param], variables=[lam])
-        elif self.backend == "qpth":
-            # qpth is a differentiable primal-dual interior-point method
-            from qpth.qp import QPFunction
-            self.QPFunction = QPFunction
         else:
             raise ValueError("backend must be 'cvxpy' or 'qpth'")
 
@@ -114,31 +106,5 @@ class ContactQPSolver:
         if self.backend == 'cvxpy':
             lam_star, = self.qp_layer(Q_chol, b)
             return lam_star
-        elif self.backend == 'qpth':
-             # qpth path (interior-point)
-            device, dtype = Q_chol.device, Q_chol.dtype
-            dim = self.dim
-            # H = Q^T Q (make PSD -> add tiny reg to ensure PD)
-            H = Q_chol.transpose(0, 1) @ Q_chol + 1e-9 * torch.eye(dim, device=device, dtype=dtype)
-            f = b  # linear term
-            G, h = self._build_ineq_mats(device, dtype)
-            # No equalities (A,b) -> use empty tensors with proper shape
-            A = torch.empty(0, dim, device=device, dtype=dtype)
-            a = torch.empty(0, device=device, dtype=dtype)
-
-            # qpth expects batch; unsqueeze and squeeze
-            Q = H.unsqueeze(0)
-            p = f.unsqueeze(0)
-            G_ = G.unsqueeze(0)
-            h_ = h.unsqueeze(0)
-            A_ = A.unsqueeze(0)
-            a_ = a.unsqueeze(0)
-
-            lam = self.QPFunction(
-                eps=self.ipm_eps,          # accuracy / (duality gap target-ish)
-                verbose=False,
-                maxIter=self.ipm_max_iter,
-                notImprovedLim=10,
-                #check_Q_spd=False
-            )(Q, p, G_, h_, A_, a_).squeeze(0)
-            return lam
+        else:
+            raise ValueError("backend must be 'cvxpy' or 'qpth'")

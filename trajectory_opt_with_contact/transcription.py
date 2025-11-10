@@ -1,5 +1,5 @@
 import torch
-# from .dynamics import implicit_euler_defects
+from .dynamics import implicit_euler_defects
 from .qp_solver import ContactQPSolver
 
 class DirectTranscriptionOptimizer:
@@ -12,9 +12,8 @@ class DirectTranscriptionOptimizer:
     def __init__(self, mass=1.0, side_length=0.2, mu=0.6,
                  horizon=60, dt=0.05, device='cuda',
                  use_second_order: bool = True,
-                 qp_backend: str = "qpth",
-                 ipm_eps: float = 1e-4,
-                 ipm_max_iter: int = 50,
+                 dynamics_solver: str = 'LCP',
+                 qp_solver = None,
                  # ALM knobs:
                  alm_enabled: bool = True,
                  alm_rho_init: float = 1e2,
@@ -37,14 +36,10 @@ class DirectTranscriptionOptimizer:
         self.device = torch.device(device)
         self.Izz = (1.0/6.0) * self.m * (self.side**2 + self.side**2)
 
-        # QP (contact) backend
-        self.qp_solver = ContactQPSolver(mu=self.mu, n_contacts=1,
-                                         backend=qp_backend,
-                                         ipm_eps=ipm_eps,
-                                         ipm_max_iter=ipm_max_iter)
-
         # Optimizer choice
+        self.dynamics_solver = dynamics_solver
         self.use_second_order = use_second_order
+        self.qp_solver = qp_solver
 
         # ALM params
         self.alm_enabled = alm_enabled
@@ -98,8 +93,7 @@ class DirectTranscriptionOptimizer:
                 qs[k], vs[k], prs[k], us[k],
                 qs[k+1], vs[k+1], prs[k+1],
                 self.h, self.m, self.Izz, self.half, self.mu,
-                self.qp_solver, device=self.device
-            )
+                self.dynamics_solver, self.qp_solver)
             all_r.append(r)
             lam_list.append(lam)
             phi_list.append(phi)

@@ -18,10 +18,10 @@ optimizer = TrajectoryOptimizer(
     mass=1.0, side_length=0.2, mu=0.6,
     horizon=30, dt=0.05,
     device='cuda' if torch.cuda.is_available() else 'cpu',
-    use_transcription=True,        # enable direct transcription
+    TO_solver='transcription', #'shooting'
+    dynamics_solver='IP',
+    # ALM params
     use_second_order=True,         # LBFGS solver for Augmented Lagrangian
-    qp_backend="qpth",             # qpth:interior-point QP for dynamics ; cvxpy: use cvxpy
-    # ALM defaults below enforce dynamics as equalities:
     alm_enabled=True,
     alm_rho_init=1e2,
     alm_target_tol=1e-6,
@@ -33,7 +33,6 @@ optimizer = TrajectoryOptimizer(
 print(f"Using device: {optimizer.device}")
 print("\nSolving with direct transcription + interior-point...")
 
-# Define problem (matching original main.py)
 q0 = [0.0, 0.0, 0.0]
 v0 = [0.0, 0.0, 0.0]
 pusher0 = [0.3, -0.3]
