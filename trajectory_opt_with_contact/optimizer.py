@@ -2,7 +2,7 @@ import torch
 from .dynamics import rollout
 from .qp_solver import ContactQPSolver
 from .transcription import DirectTranscriptionOptimizer  # NEW
-
+from .iLQR import ILQROptimizer
 class TrajectoryOptimizer:
     """
     Backward-compatible: default = your original shooting/Adam pipeline.
@@ -16,6 +16,7 @@ class TrajectoryOptimizer:
                 horizon=60, dt=0.05, device='cuda',
                 TO_solver: str = 'shooting', # or 'transcription"
                 dynamics_solver: str = 'LCP', #'IP' is interior point
+                w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
                 # ALM knobs (forwarded to DirectTranscriptionOptimizer):
                 use_second_order: bool = False, #TO solve with 1st order or 2nd order method
                 alm_enabled: bool = True, alm_rho_init: float = 1e2, alm_rho_max: float = 1e8,
@@ -57,7 +58,7 @@ class TrajectoryOptimizer:
                 alm_outer_iters=alm_outer_iters, lbfgs_inner_steps=lbfgs_inner_steps,
                 lbfgs_history=lbfgs_history
             )
-
+            
     def _to_tensor(self, x, requires_grad=False):
         if not isinstance(x, torch.Tensor):
             x = torch.tensor(x, dtype=torch.double, device=self.device)
@@ -67,6 +68,7 @@ class TrajectoryOptimizer:
         return x
 
     def optimize(self, q0, v0, pusher0, goal,
+                w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
                  u_init=None, max_iters=100, lr=0.01,
                  lr_decay_step=10, lr_decay_gamma=0.5,
                  obstacle_pos=None, verbose=True):
@@ -76,56 +78,85 @@ class TrajectoryOptimizer:
                 u_init=u_init, max_iters=max_iters, lr=lr,
                 obstacle_pos=obstacle_pos, verbose=verbose
             )
+        elif self.TO_solver == 'shooting':
+            # ---- Original shooting pipeline (unchanged) ----
+            q0 = self._to_tensor(q0, requires_grad=True)
+            v0 = self._to_tensor(v0, requires_grad=True)
+            pusher0 = self._to_tensor(pusher0, requires_grad=True)
+            goal = self._to_tensor(goal, requires_grad=False)
+            if obstacle_pos is not None:
+                obstacle_pos = self._to_tensor(obstacle_pos, requires_grad=False)
 
-        # ---- Original shooting pipeline (unchanged) ----
-        q0 = self._to_tensor(q0, requires_grad=True)
-        v0 = self._to_tensor(v0, requires_grad=True)
-        pusher0 = self._to_tensor(pusher0, requires_grad=True)
-        goal = self._to_tensor(goal, requires_grad=False)
-        if obstacle_pos is not None:
-            obstacle_pos = self._to_tensor(obstacle_pos, requires_grad=False)
+            if u_init is None:
+                u_seq = torch.zeros(self.horizon, 2, dtype=torch.double,
+                                    device=self.device, requires_grad=True)
+            else:
+                u_seq = self._to_tensor(u_init, requires_grad=True)
 
-        if u_init is None:
-            u_seq = torch.zeros(self.horizon, 2, dtype=torch.double,
-                                device=self.device, requires_grad=True)
-        else:
-            u_seq = self._to_tensor(u_init, requires_grad=True)
+            opt = torch.optim.Adam([u_seq], lr=lr)
+            sched = torch.optim.lr_scheduler.StepLR(opt, step_size=lr_decay_step, gamma=lr_decay_gamma)
 
-        opt = torch.optim.Adam([u_seq], lr=lr)
-        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=lr_decay_step, gamma=lr_decay_gamma)
+            from .dynamics import rollout
+            for it in range(max_iters):
+                opt.zero_grad()
+                print('-------------------------------------')
+                loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
+                    u_seq, q0, v0, pusher0, self.horizon, self.dt,
+                    self.m, self.Izz, self.half, self.mu, goal,
+                    w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
+                    qp_solver = self.qp_solver,
+                    dynamics_solver=self.dynamics_solver, obstacle_pos=obstacle_pos,
+                    device=self.device
+                )
+                loss.backward()
+                opt.step()
+                sched.step()
+                def to_scalar(x):
+                    return x.item() if torch.is_tensor(x) else float(x)
+                if verbose and (it+1) % 1 == 0:
+                    print(f"[Shooting] Iter {it+1:3d} | "
+                        f"Total={to_scalar(loss):.4f} | "
+                        f"Goal={to_scalar(goal_term):.4f} | "
+                        f"Ctrl={to_scalar(ctrl_term):.6f} | "
+                        f"Vel={to_scalar(v_term):.4f} | "
+                        f"Obs={to_scalar(obs_term):.4f} | "
+                        f"Pen={to_scalar(pen_term):.4f} | "
+                        f"Final x={to_scalar(q_final[0]):.3f}")
 
-        from .dynamics import rollout
-        for it in range(max_iters):
-            opt.zero_grad()
-            print('-------------------------------------')
-            loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
-                u_seq, q0, v0, pusher0, self.horizon, self.dt,
-                self.m, self.Izz, self.half, self.mu, goal,
-                qp_solver = self.qp_solver,
-                dynamics_solver=self.dynamics_solver, obstacle_pos=obstacle_pos,
-                device=self.device
+            return {
+                'loss': loss.item(),
+                'q_final': q_final.detach().cpu().numpy(),
+                'u_seq': u_seq.detach().cpu().numpy(),
+                'trajectory': qs.detach().cpu().numpy(),
+                'pusher_trajectory': pusher_traj.detach().cpu().numpy(),
+                'contact_forces': lambdas.detach().cpu().numpy(),
+                'signed_distances': phis.detach().cpu().numpy()
+            }
+        elif self.TO_solver == 'iLQR':
+            self.ilqr = ILQROptimizer(
+                mass=self.m, side_length=self.side, mu=self.mu,
+                w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
+                horizon=self.horizon, dt=self.dt, device=self.device,
+                dynamics_solver=self.dynamics_solver,
+                qp_solver=self.qp_solver,
+                obstacle_pos=obstacle_pos,
+                max_iters=max_iters, regularization=1e-4
             )
-            loss.backward()
-            opt.step()
-            sched.step()
-            def to_scalar(x):
-                return x.item() if torch.is_tensor(x) else float(x)
-            if verbose and (it+1) % 1 == 0:
-                print(f"[Shooting] Iter {it+1:3d} | "
-                    f"Total={to_scalar(loss):.4f} | "
-                    f"Goal={to_scalar(goal_term):.4f} | "
-                    f"Ctrl={to_scalar(ctrl_term):.6f} | "
-                    f"Vel={to_scalar(v_term):.4f} | "
-                    f"Obs={to_scalar(obs_term):.4f} | "
-                    f"Pen={to_scalar(pen_term):.4f} | "
-                    f"Final x={to_scalar(q_final[0]):.3f}")
-
-        return {
-            'loss': loss.item(),
-            'q_final': q_final.detach().cpu().numpy(),
-            'u_seq': u_seq.detach().cpu().numpy(),
-            'trajectory': qs.detach().cpu().numpy(),
-            'pusher_trajectory': pusher_traj.detach().cpu().numpy(),
-            'contact_forces': lambdas.detach().cpu().numpy(),
-            'signed_distances': phis.detach().cpu().numpy()
+            # iLQR uses its own iteration budget; we pass u_init if provided
+            q0_t = self._to_tensor(q0, requires_grad=False)
+            v0_t = self._to_tensor(v0, requires_grad=False)
+            p0_t = self._to_tensor(pusher0, requires_grad=False)
+            goal_t = self._to_tensor(goal, requires_grad=False)
+            u0_t = None if u_init is None else self._to_tensor(u_init, requires_grad=False)
+            out = self.ilqr.optimize(q0_t, v0_t, p0_t, goal_t, u_init=u0_t, verbose=verbose)
+            # For API consistency with shooting, return a similar dict
+            X = out["trajectory"]  # (T+1,8)
+            return {
+            'loss': out["loss"],
+            'q_final': X[-1],                           # (3,)
+            'u_seq': out["u_seq"],                      # (T,2)
+            'trajectory': X,                            # (T+1,3)
+            'pusher_trajectory': out["pusher_sequence"],# (T+1,2)
+            'contact_forces': out["contact_forces"],    # list length T
+            'signed_distances': out["signed_distances"] # list length T
         }

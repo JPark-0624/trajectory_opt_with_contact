@@ -15,9 +15,9 @@ print("="*60)
 
 # Create optimizer (matching original parameters)
 
-TO_solver = 'shooting'
+TO_solver = 'iLQR' #'shooting'
 dynamics_solver = 'IP' #'LCP'
-obs = 'obs'
+obs = '' #'obs' #
 
 print("\nCreating optimizer...")
 optimizer = TrajectoryOptimizer(
@@ -42,7 +42,7 @@ q0 = [0.0, 0.0, 0.0]
 v0 = [0.0, 0.0, 0.0]
 pusher0 = [0.3, -0.3]
 goal = [-0.2, 0.5, -0.3]
-obstacle = [0.2, -0.2]  # Obstacle position from original code
+obstacle = None # [0.2, -0.2] # # Obstacle position from original code
 u_init = [[-0.2, 0.2]] * optimizer.horizon  # Initial guess from original code
 
 
@@ -58,7 +58,7 @@ result = optimizer.optimize(
     pusher0=pusher0,
     goal=goal,
     u_init=u_init,
-    max_iters= 100, #100,
+    max_iters= 10, #iLQR doesn't need any many iterations
     lr=0.05,
     lr_decay_step=10,
     lr_decay_gamma=0.8,

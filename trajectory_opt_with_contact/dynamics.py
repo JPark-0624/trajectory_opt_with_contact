@@ -784,6 +784,7 @@ def implicit_euler_defects(qk, vk, prk, uk,
     return r, lam, phi
 
 def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy, 
+            w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
             qp_solver = None, dynamics_solver=None, obstacle_pos=None, device=None):
     """
     Rollout a trajectory given control sequence.
@@ -854,14 +855,14 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
         
         # Obstacle avoidance term
         if obstacle_pos is not None:
-            obs_term += 1.0 / (torch.sum((pr - obstacle_pos) ** 2) + 0.01)
+            obs_term += w_obs / (torch.sum((pr - obstacle_pos) ** 2) + 0.01)
     
     obs_term /= horizon
     
     # Cost function
-    goal_term = 20.0 * torch.sum((q - goal_xy) ** 2)      # Goal reaching
-    ctrl_term = 1e-3 * torch.sum(u_seq ** 2)               # Control effort
-    v_term = 0.1 * torch.sum(v ** 2)                       # Terminal velocity
+    goal_term = w_target * torch.sum((q - goal_xy) ** 2)      # Goal reaching
+    ctrl_term = w_ctrl * torch.sum(u_seq ** 2)               # Control effort
+    v_term = w_v * torch.sum(v ** 2)                       # Terminal velocity
     pen_term = 0.0  # Penetration penalty (disabled)
     
     loss = goal_term + ctrl_term + pen_term + v_term + obs_term
