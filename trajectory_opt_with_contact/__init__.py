@@ -11,6 +11,8 @@ from .dynamics import step_square, rollout, step_square_pos_ip, IPMOptions
 from .optimizer import TrajectoryOptimizer
 from .transcription import DirectTranscriptionOptimizer
 from .visualizer import TrajectoryVisualizer, visualize_result
+from .ioc import IOCFitter
+from .utils import save_demo_npz, pack_demo
 
 __version__ = "0.2.0"
 __all__ = [

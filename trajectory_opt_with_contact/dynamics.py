@@ -861,7 +861,7 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     
     # Cost function
     goal_term = w_target * torch.sum((q - goal_xy) ** 2)      # Goal reaching
-    ctrl_term = w_ctrl * torch.sum(u_seq ** 2)               # Control effort
+    ctrl_term = w_ctrl * torch.sum((u_seq*h) ** 2)               # Control effort
     v_term = w_v * torch.sum(v ** 2)                       # Terminal velocity
     pen_term = 0.0  # Penetration penalty (disabled)
     

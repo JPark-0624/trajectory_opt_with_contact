@@ -93,35 +93,137 @@ class TrajectoryOptimizer:
             else:
                 u_seq = self._to_tensor(u_init, requires_grad=True)
 
-            opt = torch.optim.Adam([u_seq], lr=lr)
-            sched = torch.optim.lr_scheduler.StepLR(opt, step_size=lr_decay_step, gamma=lr_decay_gamma)
+
+
+           
+            # opt = torch.optim.LBFGS([u_seq], max_iter=20, history_size=10,
+            #                         lr=lr, line_search_fn="strong_wolfe")
 
             from .dynamics import rollout
-            for it in range(max_iters):
-                opt.zero_grad()
-                print('-------------------------------------')
-                loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
-                    u_seq, q0, v0, pusher0, self.horizon, self.dt,
-                    self.m, self.Izz, self.half, self.mu, goal,
-                    w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
-                    qp_solver = self.qp_solver,
-                    dynamics_solver=self.dynamics_solver, obstacle_pos=obstacle_pos,
-                    device=self.device
+
+             # ============= Choose optimizer =============
+            self.use_second_order = True
+            if self.use_second_order:
+                # LBFGS for faster convergence / better stationarity
+                opt = torch.optim.LBFGS(
+                    [u_seq],
+                    lr=1.0,                      # step size for line-search
+                    max_iter=20,                 # max inner iters per .step()
+                    history_size=10,             # you already have lbfgs_history if you want
+                    line_search_fn="strong_wolfe"
                 )
-                loss.backward()
-                opt.step()
-                sched.step()
-                def to_scalar(x):
-                    return x.item() if torch.is_tensor(x) else float(x)
-                if verbose and (it+1) % 1 == 0:
-                    print(f"[Shooting] Iter {it+1:3d} | "
-                        f"Total={to_scalar(loss):.4f} | "
-                        f"Goal={to_scalar(goal_term):.4f} | "
-                        f"Ctrl={to_scalar(ctrl_term):.6f} | "
-                        f"Vel={to_scalar(v_term):.4f} | "
-                        f"Obs={to_scalar(obs_term):.4f} | "
-                        f"Pen={to_scalar(pen_term):.4f} | "
-                        f"Final x={to_scalar(q_final[0]):.3f}")
+
+                def closure():
+                    opt.zero_grad()
+                    loss, q_final, lambdas, phis, qs, pusher_traj, \
+                        goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
+                            u_seq, q0, v0, pusher0,
+                            self.horizon, self.dt,
+                            self.m, self.Izz, self.half, self.mu, goal,
+                            w_target=w_target, w_v=w_v,
+                            w_ctrl=w_ctrl, w_obs=w_obs,
+                            qp_solver=self.qp_solver,
+                            dynamics_solver=self.dynamics_solver,
+                            obstacle_pos=obstacle_pos,
+                            device=self.device
+                        )
+                    loss.backward()
+                    return loss
+
+                # Outer loop just to inspect progress
+                for it in range(max_iters):
+                    loss = opt.step(closure)
+
+                    # Optional: recompute terms & grad norm for logging
+                    with torch.no_grad():
+                        loss_eval, q_final, lambdas, phis, qs, pusher_traj, \
+                            goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
+                                u_seq, q0, v0, pusher0,
+                                self.horizon, self.dt,
+                                self.m, self.Izz, self.half, self.mu, goal,
+                                w_target=w_target, w_v=w_v,
+                                w_ctrl=w_ctrl, w_obs=w_obs,
+                                qp_solver=self.qp_solver,
+                                dynamics_solver=self.dynamics_solver,
+                                obstacle_pos=obstacle_pos,
+                                device=self.device
+                            )
+
+                    # Compute gradient norm at current u_seq
+                    u_tmp = u_seq.detach().clone().requires_grad_(True)
+                    loss_for_grad, *_ = rollout(
+                        u_tmp, q0, v0, pusher0,
+                        self.horizon, self.dt,
+                        self.m, self.Izz, self.half, self.mu, goal,
+                        w_target=w_target, w_v=w_v,
+                        w_ctrl=w_ctrl, w_obs=w_obs,
+                        qp_solver=self.qp_solver,
+                        dynamics_solver=self.dynamics_solver,
+                        obstacle_pos=obstacle_pos,
+                        device=self.device
+                    )
+                    (grad_u,) = torch.autograd.grad(loss_for_grad, u_tmp)
+                    grad_norm = grad_u.norm().item()
+
+                    if verbose:
+                        def to_scalar(x):
+                            return x.item() if torch.is_tensor(x) else float(x)
+                        print(
+                            f"[Shooting-LBFGS] Iter {it+1:3d} | "
+                            f"Total={to_scalar(loss_eval):.4f} | "
+                            f"Goal={to_scalar(goal_term):.4f} | "
+                            f"Ctrl={to_scalar(ctrl_term):.6f} | "
+                            f"Vel={to_scalar(v_term):.4f} | "
+                            f"Obs={to_scalar(obs_term):.4f} | "
+                            f"Pen={to_scalar(pen_term):.4f} | "
+                            f"||∇_u J||={grad_norm:.3e}"
+                        )
+
+                    # (Optional early stop)
+                    if grad_norm < 1e-4:
+                        if verbose:
+                            print(f"[Shooting-LBFGS] Early stop, grad_norm={grad_norm:.3e}")
+                        break
+
+            else:
+            
+                opt = torch.optim.Adam([u_seq], lr=lr)
+                sched = torch.optim.lr_scheduler.StepLR(opt, step_size=lr_decay_step, gamma=lr_decay_gamma)
+
+                for it in range(max_iters):
+                    opt.zero_grad()
+
+                    loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
+                        u_seq, q0, v0, pusher0, self.horizon, self.dt,
+                        self.m, self.Izz, self.half, self.mu, goal,
+                        w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
+                        qp_solver = self.qp_solver,
+                        dynamics_solver=self.dynamics_solver, obstacle_pos=obstacle_pos,
+                        device=self.device
+                    )
+
+                    # (grad_u,) = torch.autograd.grad(loss, u_seq, create_graph=True, retain_graph=True)
+                    # print('KKT_stationarity:', grad_u.norm().item())
+
+                    loss.backward()
+                    grad_norm = u_seq.grad.norm().item()
+                    print(f"||grad_u||={grad_norm:.4e}")
+                    #print(u_seq.grad)
+
+
+                    opt.step()
+                    # sched.step()
+                    def to_scalar(x):
+                        return x.item() if torch.is_tensor(x) else float(x)
+                    if verbose and (it+1) % 1 == 0:
+                        print(f"[Shooting] Iter {it+1:3d} | "
+                            f"Total={to_scalar(loss):.4f} | "
+                            f"Goal={to_scalar(goal_term):.4f} | "
+                            f"Ctrl={to_scalar(ctrl_term):.6f} | "
+                            f"Vel={to_scalar(v_term):.4f} | "
+                            f"Obs={to_scalar(obs_term):.4f} | "
+                            f"Pen={to_scalar(pen_term):.4f} | "
+                            f"Final x={to_scalar(q_final[0]):.3f}")
 
             return {
                 'loss': loss.item(),

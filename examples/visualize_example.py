@@ -15,7 +15,7 @@ print("="*60)
 
 # Create optimizer (matching original parameters)
 
-TO_solver = 'iLQR' #'shooting'
+TO_solver = 'shooting' #'iLQR' #
 dynamics_solver = 'IP' #'LCP'
 obs = '' #'obs' #
 
@@ -58,10 +58,10 @@ result = optimizer.optimize(
     pusher0=pusher0,
     goal=goal,
     u_init=u_init,
-    max_iters= 10, #iLQR doesn't need any many iterations
-    lr=0.05,
-    lr_decay_step=10,
-    lr_decay_gamma=0.8,
+    max_iters= 50, #iLQR doesn't need any many iterations
+    lr=0.2, #0.05,
+    lr_decay_step=5, #10,
+    lr_decay_gamma=0.5, # 0.8,
     obstacle_pos=obstacle,
     verbose=True
 )
