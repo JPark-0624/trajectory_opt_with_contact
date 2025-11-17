@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from .dynamics import IPMOptions
 import numpy as np
+from icecream import ic
 
 # NEW: iLQR optimizer ---------------------------------------------------------
 class ILQROptimizer:
@@ -29,7 +30,7 @@ class ILQROptimizer:
                  obstacle_pos=None,
                  # ilqr knobs
                  max_iters=50, regularization=1e-4, reg_scale=10.0,
-                 min_reg=1e-8, max_reg=1e8, line_search_alphas=(1.0, 0.5, 0.25, 0.1, 0.05)):
+                 min_reg=1e-8, max_reg=1e5, line_search_alphas=(1.0, 0.5, 0.25, 0.1, 0.05)):
         self.m = mass
         self.side = side_length
         self.half = side_length / 2.0
@@ -59,6 +60,13 @@ class ILQROptimizer:
         # Hook the correct one-step dynamics
         self.dynamics_solver = dynamics_solver
         self.qp_solver = qp_solver
+
+        if self.dynamics_solver=='IP':
+            self.ipm_opts=IPMOptions(target_mu=1e-3, max_newton=20, tol=1e-3, smooth_sdf=50.0, #smooth_sdf is unused
+                    enable_viscous_ground_friction=True,
+                    c_lin=8.0,          
+                    c_ang=8.0 * self.half     
+                    )
         try:
             # Import your one-step functions from .dynamics
             from .dynamics import step_square, step_square_pos_ip  # noqa: F401
@@ -101,7 +109,7 @@ class ILQROptimizer:
         pusher_next = pusher + self.dt * u
 
         if self.dynamics_solver == "LCP":
-            q_next, v_next, lambdas, phi = self._step_square(
+            q_next, v_next, pusher_pos_next,lambdas, phi = self._step_square(
                 q, v, pusher, u, self.dt,
                 self.m, self.Izz, self.half, self.mu,
                 qp_solver=self.qp_solver,
@@ -112,14 +120,11 @@ class ILQROptimizer:
             q_next, v_next, pusher_pos_next, lambdas, phi = self._step_square_ip(
                 q, v, pusher, u, self.dt,
                 self.m, self.Izz, self.half, self.mu,
-                ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-5, smooth_sdf=50.0, #smooth_sdf is unused
-                    enable_viscous_ground_friction=True,
-                    c_lin=8.0,          
-                    c_ang=8.0 * self.half     
-                    ),
+                ipm_opts=self.ipm_opts,
                 skip_solving_threshold=0.3)
 
         return self._pack_x(q_next, v_next, pusher_next)
+
 
     # ---------------------------------------------------------------
     # Costs
@@ -136,7 +141,7 @@ class ILQROptimizer:
             diff = p - self.obstacle_pos
             dist2 = (diff @ diff)
             cost = cost + (self.w_obs / float(self.horizon)) * (1.0 / (dist2 + 0.01))
-
+            #ic((self.w_obs / float(self.horizon)) * (1.0 / (dist2 + 0.01)))
         return cost
 
     def terminal_cost(self, x_T, goal):
@@ -227,35 +232,6 @@ class ILQROptimizer:
             lxx[6:8, 6:8] = lxx[6:8, 6:8] + H
 
         return lx, lu, lxx, luu, lux
-    # def quad_cost_terms(self, x, u):
-    #     """
-    #     Return (lx, lu, lxx, luu, lux) of stage cost at (x,u).
-    #     """
-    #     x = x.detach().requires_grad_(True)
-    #     u = u.detach().requires_grad_(True)
-    #     l = self.stage_cost(x, u)
-
-    #     # First-order
-    #     (lx,) = torch.autograd.grad(l, x, retain_graph=True, create_graph=True)
-    #     (lu,) = torch.autograd.grad(l, u, retain_graph=True, create_graph=True)
-
-    #     # Second-order (Hessians)
-    #     lxx = torch.zeros((x.numel(), x.numel()), dtype=self.dtype, device=self.device)
-    #     for i in range(x.numel()):
-    #         (gxi,) = torch.autograd.grad(lx[i], x, retain_graph=True)
-    #         lxx[i] = gxi
-
-    #     luu = torch.zeros((u.numel(), u.numel()), dtype=self.dtype, device=self.device)
-    #     for i in range(u.numel()):
-    #         (gui,) = torch.autograd.grad(lu[i], u, retain_graph=True)
-    #         luu[i] = gui
-
-    #     lux = torch.zeros((u.numel(), x.numel()), dtype=self.dtype, device=self.device)
-    #     for i in range(u.numel()):
-    #         (guxi,) = torch.autograd.grad(lu[i], x, retain_graph=True)
-    #         lux[i] = guxi
-
-    #     return lx, lu, lxx, luu, lux
 
     def quad_terminal_terms(self, xT):
         """
@@ -295,11 +271,15 @@ class ILQROptimizer:
             max_iters = self.max_iters
 
         # Nominal rollout
-        X, J = self.rollout(x0, U)
+        with torch.no_grad():
+            X, J = self.rollout(x0, U)
         best_J = J.item()
         best = (X.clone(), U.clone(), best_J)
 
         for it in range(max_iters):
+            with torch.no_grad():
+                X, J = self.rollout(x0, U)
+            J_nom = J.item() # nominal cost for this iteration
             # Linearize dynamics and quadraticize cost along nominal
             A_list, B_list = [], []
             lx_list, lu_list, lxx_list, luu_list, lux_list = [], [], [], [], []
@@ -340,17 +320,17 @@ class ILQROptimizer:
                 try:
                     L = torch.linalg.cholesky(Quu_reg)
                     Quu_inv = torch.cholesky_inverse(L)
-                except RuntimeError:
+                except RuntimeError as e:
+                    print(f"An error occurred: {e}")
                     diverged = True
                     break
 
                 K = - Quu_inv @ Qux       # (2x8)
                 kff = - Quu_inv @ Qu      # (2,)
 
-                # Update value function
-                Vx  = Qx  + K.T @ Quu @ kff + Qux.T @ kff + K.T @ Qu + Qx*0.0  # keep shape; algebraic clarity
-                Vxx = Qxx + K.T @ Quu @ K  + Qux.T @ K + K.T @ Qux
-                # (symmetrize to control numerical issues)
+                # Use Quu_reg in value update
+                Vx  = Qx  + K.T @ Quu_reg @ kff + Qux.T @ kff + K.T @ Qu
+                Vxx = Qxx + K.T @ Quu_reg @ K   + Qux.T @ K + K.T @ Qux
                 Vxx = 0.5 * (Vxx + Vxx.T)
 
                 K_list.append(K)
@@ -381,11 +361,12 @@ class ILQROptimizer:
                     cost_new = cost_new + self.stage_cost(xk, u_try)
                     x_next = self.f(xk, u_try)
                     X_new.append(x_next)
-
+                            
                 cost_new = cost_new + self.terminal_cost(X_new[-1], self.goal)
                 J_new = cost_new.item()
-
-                if J_new < best_J - 1e-9:
+                # ic(self.goal, X_new[-1])
+                #if J_new < best_J - 1e-9:
+                if J_new < J_nom - 1e-6:
                     accepted = True
                     X = torch.stack(X_new, dim=0)
                     U = torch.stack(U_new, dim=0)
@@ -406,10 +387,15 @@ class ILQROptimizer:
                 if self.reg >= self.max_reg * 0.99:
                     break
 
+            # --- Optional: gradient-norm convergence check at final solution ---
+            if verbose:
+                # x0 is the first state of the best trajectory
+                grad_norm = self.control_grad_norm(x0, U)
+                print(f"[iLQR] Final ||dJ/dU|| = {grad_norm:.3e}")
+                
         Xb, Ub, Jb = best
         # Collect contacts/phis with a final pass
-        qs, ps, lambdas, phis = self.rollout_with_contacts(Xb[0], Ub)
-
+        qs, ps, lambdas, phis = self.rollout_with_contacts(Xb[0], Ub) #self.rollout_with_contacts(Xb[0], Ub)
         # Convert contacts to CPU/numpy safely (shapes may vary by solver)
         def to_numpy_list(tensors):
             out = []
@@ -431,7 +417,7 @@ class ILQROptimizer:
 
     def _step_with_contacts(self, q, v, pusher, u):
         if self.dynamics_solver == "LCP":
-            q_next, v_next, lambdas, phi = self._step_square(
+            q_next, v_next, pusher_pos_next, lambdas, phi = self._step_square(
                 q, v, pusher, u, self.dt,
                 self.m, self.Izz, self.half, self.mu,
                 qp_solver=self.qp_solver,
@@ -442,11 +428,7 @@ class ILQROptimizer:
             q_next, v_next, pusher_pos_next, lambdas, phi = self._step_square_ip(
                 q, v, pusher, u, self.dt,
                 self.m, self.Izz, self.half, self.mu,
-                ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-5, smooth_sdf=50.0, #smooth_sdf is unused
-                    enable_viscous_ground_friction=True,
-                    c_lin=8.0,          
-                    c_ang=8.0 * self.half     
-                    ),
+                ipm_opts=self.ipm_opts,
                 skip_solving_threshold=0.3)
         return q_next, v_next, lambdas, phi
 
@@ -483,3 +465,27 @@ class ILQROptimizer:
         qs = torch.stack(q_hist, dim=0)   # (T+1,3)
         ps = torch.stack(p_hist, dim=0)   # (T+1,2)
         return qs, ps, lambdas, phis
+
+    def rollout_no_contacts(self, x0, U):
+        X = [x0]
+        for k in range(U.shape[0]):
+            X.append(self.f(X[-1], U[k]))
+        return torch.stack(X, dim=0)
+
+    def control_grad_norm(self, x0, U):
+        """
+        Compute ||dJ/dU||_2 at the current control sequence U, with fixed x0.
+        This uses autograd on the rollout() function.
+        """
+        # Make a differentiable copy of U
+        U_var = U.detach().clone().requires_grad_(True)
+        x0 = x0.detach().clone().requires_grad_(True)
+        # Rollout with gradient tracking
+        X, J = self.rollout(x0, U_var)
+
+        # Gradient of scalar cost J wrt all controls U_var (T x 2)
+        (grad_U,) = torch.autograd.grad(J, U_var, create_graph=False, retain_graph=False)
+
+        # L2 norm of the full gradient vector
+        grad_norm = grad_U.norm().item()
+        return grad_norm

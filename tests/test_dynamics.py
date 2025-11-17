@@ -100,10 +100,10 @@ for k in range(horizon):
     # ========================= Small demo usage (pseudo) ========================= #
     # damping is implemented differently (apply damping force instead of damping on vel)
     # Also thye lam here is actual force, not impulse
-    q_next, v_next, pr_next, lam, phi = step_square_pos_ip(
+    q_next, v_next, pr_next, lam, phi = step_square_pos_ip2(
        q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
        skip_solving_threshold = 0.3,
-        ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-4, smooth_sdf=5.0,
+        ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-3, smooth_sdf=5.0,
         enable_viscous_ground_friction=True,
         c_lin=80.0,          
         c_ang=80.0 * half     
@@ -123,28 +123,26 @@ for k in range(horizon):
     lams_ip.append(lam)
     phis_ip.append(phi)
     q, v, pr = q_next, v_next, pr_next
-
+print('%%%%%%')
 print(f'Time elapsed for IP forward calculation: {time.time() - start_time}')
 
-exit()
 
 ## Test Gradient calculation time
-start_time = time.time()
-u_seq.requires_grad = True
-q0.requires_grad = True
-v0.requires_grad = True
-pr0.requires_grad = True
-loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
-    u_seq, q0, v0, pr0, horizon, h,
-    m, Izz, half, mu, goal,
-    w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
-    qp_solver = None,
-    dynamics_solver='IP', obstacle_pos=None,
-    device=device
-)
-loss.backward()
-
-print(f'Time elapsed for IP forward + backward calculation: {time.time() - start_time}')
+# start_time = time.time()
+# u_seq.requires_grad = True
+# q0.requires_grad = True
+# v0.requires_grad = True
+# pr0.requires_grad = True
+# loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
+#     u_seq, q0, v0, pr0, horizon, h,
+#     m, Izz, half, mu, goal,
+#     w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
+#     qp_solver = None,
+#     dynamics_solver='IP', obstacle_pos=None,
+#     device=device
+# )
+# loss.backward()
+# print(f'Time elapsed for IP forward + backward calculation: {time.time() - start_time}')
 
 
 
