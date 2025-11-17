@@ -15,7 +15,7 @@ print("="*60)
 
 # Create optimizer (matching original parameters)
 
-TO_solver = 'iLQR' #'shooting' #
+TO_solver = 'shooting' #'iLQR' #
 dynamics_solver = 'IP' #'LCP' ##
 obs = 'obs' #'' #
 
@@ -26,7 +26,7 @@ optimizer = TrajectoryOptimizer(
     device='cuda' if torch.cuda.is_available() else 'cpu',
     TO_solver=TO_solver,
     dynamics_solver=dynamics_solver, #'LCP',
-    use_second_order=True,  
+    use_second_order=False,  
     # ALM params
     alm_enabled=True,
     alm_rho_init=1e2,
