@@ -301,7 +301,8 @@ class AnalyticalJacobian:
                  half_length: float,
                  mu: float,
                  dt: float,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 dtype: torch.dtype = torch.float64):
         """
         Args:
             mass: slider mass
@@ -310,6 +311,7 @@ class AnalyticalJacobian:
             mu: coefficient of friction
             dt: time step
             device: 'cpu' or 'cuda'
+            dtype: torch dtype (default: torch.float64)
         """
         self.m = mass
         self.Izz = Izz
@@ -317,12 +319,13 @@ class AnalyticalJacobian:
         self.mu = mu
         self.h = dt
         self.device = device
+        self.dtype = dtype
         
         # Mass matrix and its inverse
         self.M = torch.diag(torch.tensor([mass, mass, Izz], 
-                                         dtype=torch.float64, device=device))
+                                         dtype=dtype, device=device))
         self.M_inv = torch.diag(torch.tensor([1/mass, 1/mass, 1/Izz], 
-                                             dtype=torch.float64, device=device))
+                                             dtype=dtype, device=device))
     
     def compute_jacobian(self, 
                          z: torch.Tensor,
@@ -419,17 +422,17 @@ class AnalyticalJacobian:
         w = z[12:14]    # slip dual variables (2)
         
         # Initialize Jacobian
-        J = torch.zeros(14, 14, dtype=torch.float64, device=self.device)
+        J = torch.zeros(14, 14, dtype=self.dtype, device=self.device)
         
         # ============================================================
         # EASY BLOCKS - Fixed indices for z = [q, v, λN, β, r, y, s, w]
         # ============================================================
         
         # Block D: ∂r_kin/∂q = I (3×3)
-        J[3:6, 0:3] = torch.eye(3, dtype=torch.float64, device=self.device)
+        J[3:6, 0:3] = torch.eye(3, dtype=self.dtype, device=self.device)
         
         # Block E: ∂r_kin/∂v = -h*I (3×3)
-        J[3:6, 3:6] = -self.h * torch.eye(3, dtype=torch.float64, device=self.device)
+        J[3:6, 3:6] = -self.h * torch.eye(3, dtype=self.dtype, device=self.device)
         
         # Block H: ∂r_gap/∂y = 1 (1×1)
         J[6, 10] = 1.0
@@ -438,7 +441,7 @@ class AnalyticalJacobian:
         J[7, 6] = -self.mu
         
         # Block J: ∂r_cone/∂β = [1, 1] (1×2)
-        J[7, 7:9] = torch.ones(2, dtype=torch.float64, device=self.device)
+        J[7, 7:9] = torch.ones(2, dtype=self.dtype, device=self.device)
         
         # Block K: ∂r_cone/∂s = 1 (1×1)
         J[7, 11] = 1.0
@@ -447,7 +450,7 @@ class AnalyticalJacobian:
         # Will be computed in medium blocks section
         
         # Block N: ∂r_slip/∂w = I (2×2)
-        J[8:10, 12:14] = torch.eye(2, dtype=torch.float64, device=self.device)
+        J[8:10, 12:14] = torch.eye(2, dtype=self.dtype, device=self.device)
         
         # Complementarity blocks
         # Block O: ∂(y*λN)/∂λN = y (1×1)
@@ -491,7 +494,7 @@ class AnalyticalJacobian:
             # Block B: ∂r_dyn/∂v (3×3) - this should be I (identity)!
             # r_dyn = v - vk - M_inv @ impulse
             # ∂r_dyn/∂v = I
-            J[0:3, 3:6] = torch.eye(3, dtype=torch.float64, device=self.device)
+            J[0:3, 3:6] = torch.eye(3, dtype=self.dtype, device=self.device)
             
             # Block G: ∂r_gap/∂q (1×3)
             # r_gap = y - phi(q)
@@ -594,7 +597,7 @@ class AnalyticalJacobian:
         # from your_module import obb_contact_blend2, compute_signed_distance
         
         # Placeholder: finite difference for signed distance
-        dphi_dq = torch.zeros(3, dtype=torch.float64, device=self.device)
+        dphi_dq = torch.zeros(3, dtype=self.dtype, device=self.device)
         phi_0 = self._compute_signed_distance(q, pusher_pos)
         
         for i in range(3):
@@ -606,7 +609,7 @@ class AnalyticalJacobian:
         grads['dphi_dq'] = dphi_dq
         
         # Placeholder: contact normal gradient (finite difference)
-        dn_dq = torch.zeros(2, 3, dtype=torch.float64, device=self.device)
+        dn_dq = torch.zeros(2, 3, dtype=self.dtype, device=self.device)
         n_0 = self._compute_contact_normal(q, pusher_pos)
         
         for i in range(3):
@@ -618,7 +621,7 @@ class AnalyticalJacobian:
         grads['dn_dq'] = dn_dq
         
         # Placeholder: tangent gradient
-        dt_dq = torch.zeros(2, 3, dtype=torch.float64, device=self.device)
+        dt_dq = torch.zeros(2, 3, dtype=self.dtype, device=self.device)
         t_0 = self._compute_tangent(q, pusher_pos)
         
         for i in range(3):
@@ -695,7 +698,7 @@ class AnalyticalJacobian:
         # TODO: Implement analytical version in Phase 3
         
         eps = 1e-6  # Finite difference epsilon (increased for stability)
-        block_A = torch.zeros(3, 3, dtype=torch.float64, device=self.device)
+        block_A = torch.zeros(3, 3, dtype=self.dtype, device=self.device)
         
         # Compute reference dynamics force
         Jn_0 = self._compute_contact_jacobian_normal(q, pusher_pos)  # (3,)
@@ -762,7 +765,7 @@ class AnalyticalJacobian:
         Returns (2, 3) matrix
         """
         eps = 1e-6
-        J_vfacets_q = torch.zeros(2, 3, dtype=torch.float64, device=self.device)
+        J_vfacets_q = torch.zeros(2, 3, dtype=self.dtype, device=self.device)
         
         # Compute reference tangent velocities
         t_0 = self._compute_tangent(q, pusher_pos)
@@ -828,6 +831,9 @@ class AnalyticalJacobian:
         cnt = obb_contact_blend2(q, pusher_pos, self.half)
         _, Jt = contact_jacobians(cnt.normal, cnt.tangent, cnt.r_cp)
         return Jt
+
+
+
 
 
 def pack_z(q, v, λN, β, r, y, s, w):

@@ -8,6 +8,7 @@ using differentiable QP solvers.
 import torch
 from .geometry import contact_frame_and_J, contact_jacobians, perp, _linearize_obb_gap_at
 from .qp_solver import ContactQPSolver
+from .analytical_jacobian import AnalyticalJacobian
 from dataclasses import dataclass
 from icecream import ic
 
@@ -140,11 +141,16 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 target_mu, smooth_sdf, tol, max_newton,
                 frac_to_boundary, ls_beta,
                 enable_viscous_ground_friction, c_lin, c_ang,
-                skip_solving_threshold):
+                skip_solving_threshold,
+                use_analytical_jacobian):  # NEW PARAMETER
         """
         All differentiable arguments must be tensors.
         Scalars like m, Izz, half, mu can be tensors (dtype/shape-compatible).
         You can choose which ones require grad.
+        
+        Args:
+            use_analytical_jacobian: If True, use analytical Jacobian computation.
+                                     If False, use PyTorch autograd (default).
         """
         device = qk.device
         dtype = qk.dtype
@@ -158,6 +164,19 @@ class StepSquarePosIPFn(torch.autograd.Function):
 
         c_linT = torch.tensor(c_lin, dtype=dtype, device=device)
         c_angT = torch.tensor(c_ang, dtype=dtype, device=device)
+
+        # Initialize analytical Jacobian computer if requested
+        analytical_jac = None
+        if use_analytical_jacobian:
+            analytical_jac = AnalyticalJacobian(
+                mass = m,
+                Izz = Izz,
+                half_length = half,
+                mu=mu,
+                dt=h,
+                device=device,
+                dtype=dtype
+            )
 
 
         # Mass inverse
@@ -264,18 +283,27 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 if float(torch.linalg.norm(R)) < float(tol):
                     break
 
-                # Build graph only for J
-                z_req = z.detach().requires_grad_(True)
-                with torch.enable_grad():
-                    J = torch.autograd.functional.jacobian(
-                        residual,
-                        z_req,
-                        strict=False,
-                        create_graph=False,
-                        vectorize=True,  # <-- important
+                # Build Jacobian: analytical or autograd
+                if use_analytical_jacobian:
+                    # Use analytical Jacobian computation
+                    _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
+                    J = analytical_jac.compute_jacobian(z, R,
+                        pusher_pos=pusher_pos_next
                     )
-                J = J.reshape(R.numel(), z_req.numel())
-                J_last = J.detach()
+                    J_last = J.detach()
+                else:
+                    # Use PyTorch autograd (original method)
+                    z_req = z.detach().requires_grad_(True)
+                    with torch.enable_grad():
+                        J = torch.autograd.functional.jacobian(
+                            residual,
+                            z_req,
+                            strict=False,
+                            create_graph=False,
+                            vectorize=True,  # <-- important
+                        )
+                    J = J.reshape(R.numel(), z_req.numel())
+                    J_last = J.detach()
 
                 reg = 1e-8 * torch.eye(J.shape[0], dtype=dtype, device=device)
                 try:
@@ -326,17 +354,26 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 if not good:
                     z = z_trial.detach()
         if J_last is None:
-            z_req = z.detach().requires_grad_(True)
-            with torch.enable_grad():
-                R = residual(z_req)
-                J = torch.autograd.functional.jacobian(
-                    residual,
-                    z_req,
-                    strict=False,
-                    create_graph=False,
-                    vectorize=True,
-                )
-            J_last = J.reshape(R.numel(), z_req.numel()).detach()
+            # Compute final Jacobian: analytical or autograd
+            if use_analytical_jacobian:
+                _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
+                J = analytical_jac.compute_jacobian(z, R,
+                        pusher_pos=pusher_pos_next
+                    )
+                J_last = J.detach()
+            else:
+                # Use PyTorch autograd (original method)
+                z_req = z.detach().requires_grad_(True)
+                with torch.enable_grad():
+                    R = residual(z_req)
+                    J = torch.autograd.functional.jacobian(
+                        residual,
+                        z_req,
+                        strict=False,
+                        create_graph=False,
+                        vectorize=True,
+                    )
+                J_last = J.reshape(R.numel(), z_req.numel()).detach()
 
         # at end of forward, after you have z and J_last
         q_next = z[0:3]
@@ -565,7 +602,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
         # The rest (non-tensor hyperparameters) have no gradients
         return (g_qk, g_vk, g_pusher, g_u,
                 None, None, None, None, None, #g_h, g_m, g_Izz, g_half, g_mu,
-                None, None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, None, None)  # Added one more None for use_analytical_jacobian
 
 def step_square_pos_ip(
     qk: torch.Tensor,
@@ -579,10 +616,15 @@ def step_square_pos_ip(
     mu: torch.Tensor,
     ipm_opts: IPMOptions,
     skip_solving_threshold: float,
+    use_analytical_jacobian: bool = False,  # NEW PARAMETER
     ):
     """
     Wrapper with the same outputs as your original step() but with
     implicit (IFT) gradients instead of backprop through iterations.
+    
+    Args:
+        use_analytical_jacobian: If True, use analytical Jacobian computation.
+                                 If False, use PyTorch autograd (default).
     """
     return StepSquarePosIPFn.apply(
         qk, vk, pusher_pos, u_push,
@@ -597,6 +639,7 @@ def step_square_pos_ip(
         torch.tensor(getattr(ipm_opts, "c_lin", 0.0), device=qk.device, dtype=qk.dtype),
         torch.tensor(getattr(ipm_opts, "c_ang", 0.0), device=qk.device, dtype=qk.dtype),
         torch.tensor(skip_solving_threshold, device=qk.device, dtype=qk.dtype),
+        torch.tensor(use_analytical_jacobian, device=qk.device, dtype=torch.bool),  # NEW
     )
 
 
@@ -712,4 +755,3 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     
     return loss, q, torch.stack(lambdas), torch.stack(phis), torch.stack(qs), torch.stack(qrobot_hist),\
         goal_term, ctrl_term, v_term, obs_term, pen_term
-
