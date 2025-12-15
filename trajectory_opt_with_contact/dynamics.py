@@ -5,10 +5,11 @@ Implements time-stepping for rigid body dynamics with frictional contact
 using differentiable QP solvers.
 """
 
+import string
 import torch
 from .geometry import contact_frame_and_J, contact_jacobians, perp, _linearize_obb_gap_at
 from .qp_solver import ContactQPSolver
-from .analytical_jacobian import AnalyticalJacobian
+from .analytical_jacobian import AnalyticalJacobian, HybridJacobian
 from dataclasses import dataclass
 from icecream import ic
 
@@ -142,15 +143,16 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 frac_to_boundary, ls_beta,
                 enable_viscous_ground_friction, c_lin, c_ang,
                 skip_solving_threshold,
-                use_analytical_jacobian):  # NEW PARAMETER
+                jacobian_type):  # NEW PARAMETER
         """
         All differentiable arguments must be tensors.
         Scalars like m, Izz, half, mu can be tensors (dtype/shape-compatible).
         You can choose which ones require grad.
         
         Args:
-            use_analytical_jacobian: If True, use analytical Jacobian computation.
-                                     If False, use PyTorch autograd (default).
+            jacobian_type: "analytical" for analytical Jacobian computation,
+                        "hybrid" for hybrid Jacobian computation (analytical + autograd),
+                        "autograd" for PyTorch autograd (default).
         """
         device = qk.device
         dtype = qk.dtype
@@ -166,18 +168,35 @@ class StepSquarePosIPFn(torch.autograd.Function):
         c_angT = torch.tensor(c_ang, dtype=dtype, device=device)
 
         # Initialize analytical Jacobian computer if requested
-        analytical_jac = None
-        if use_analytical_jacobian:
-            analytical_jac = AnalyticalJacobian(
+        
+        if jacobian_type == "analytical":
+            analytical_jacobian = AnalyticalJacobian(
                 mass = m,
                 Izz = Izz,
                 half_length = half,
                 mu=mu,
-                dt=h,
+                h=h,
                 device=device,
-                dtype=dtype
+                dtype=dtype,
+                enable_viscous_ground_friction=enable_viscous_ground_friction,
+                c_lin=c_lin,
+                c_ang=c_ang
             )
-
+        elif jacobian_type == "hybrid":
+            hybrid_jacobian = HybridJacobian(
+                mass = m,
+                Izz = Izz,
+                half_length = half,
+                mu=mu,
+                h=h,
+                device=device,
+                dtype=dtype,
+                enable_viscous_ground_friction=enable_viscous_ground_friction,
+                c_lin=c_lin,
+                c_ang=c_ang
+            )
+        elif jacobian_type == "autograd":
+            pass
 
         # Mass inverse
         M_inv = torch.diag(torch.stack([1.0/mT, 1.0/mT, 1.0/IzzT]))
@@ -226,7 +245,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
 
             cnt = obb_contact_blend2(_q, pusher_pos_next, halfT)  # user-provided, differentiable
             n, t, r_cp = cnt.normal, cnt.tangent, cnt.r_cp
-            Jn, Jt = contact_jacobians(n, t, r_cp)               # user-provided
+            Jn, Jt = contact_jacobians(n, t, r_cp)      # user-provided
 
             # Tangential rel velocity at cp
             v_cp = _v[0:2] + _v[2] * perp(r_cp)
@@ -263,6 +282,70 @@ class StepSquarePosIPFn(torch.autograd.Function):
             return torch.cat([r_dyn, r_kin, r_gap.view(1), r_cone.view(1), r_slip,
                               r_c1.view(1), r_c2.view(1), r_c3])
 
+        def compute_geom_grads(q, v, lamN, beta, pusher_pos, u_push, halfT):
+            """
+                Computes all geometry terms + their derivatives,
+                consistent with dynamics.py residual.
+                Uses autograd for all geometry derivatives.
+            """
+
+            # --- 1. Compute geometry (same as forward residual) ---
+            cnt = obb_contact_blend2(q, pusher_pos, halfT)
+            n  = cnt.normal
+            t  = cnt.tangent
+            r_cp = cnt.r_cp
+
+            # contact jacobians
+            Jn, Jt = contact_jacobians(n, t, r_cp)
+
+            # --- 2. phi(q) gradient ---
+            phi = cnt.phi
+            dphi_dq = torch.autograd.grad(phi, q, retain_graph=True)[0]
+
+            # --- 3. tangent relative velocity ---
+
+            perp_rcp = torch.stack([-r_cp[1], r_cp[0]])
+            v_cp = v[0:2] + v[2] * perp_rcp
+            v_rel = v_cp - u_push  # or v_push depending on your code
+            v_rel_t = torch.dot(t, v_rel)
+
+            # derivatives wrt q and v
+            dvfac_dq = torch.autograd.grad(v_rel_t, q, retain_graph=True)[0]
+            dvfac_dv = torch.autograd.grad(v_rel_t, v, retain_graph=True)[0]
+
+            # --- 4. contact impulse derivative wrt q ---
+                    
+            # force(q) = Jn(q)*lamN + Jt(q)*(beta0 - beta1)
+
+            lam = lamN
+            slip = beta[0] - beta[1]
+
+            def force_fn(q_local: torch.Tensor) -> torch.Tensor:
+                cnt_loc = obb_contact_blend2(q_local, pusher_pos, halfT)
+                n_loc, t_loc, r_cp_loc = cnt_loc.normal, cnt_loc.tangent, cnt_loc.r_cp
+                Jn_loc, Jt_loc = contact_jacobians(n_loc, t_loc, r_cp_loc)
+                force_loc = Jn_loc * lam + Jt_loc * slip   # (3,)
+                return force_loc
+
+            # dforce_dq: (3,3), row i: ∂force_i/∂q_j
+            dforce_dq = torch.autograd.functional.jacobian(
+                force_fn,
+                q,
+                vectorize=True,
+                create_graph=False
+            )                           # (3,3)
+
+            geom_grad = {
+                'cnt': cnt,
+                'Jn': Jn,
+                'Jt': Jt,
+                'dphi_dq': dphi_dq,
+                'dvfac_dq': torch.stack([dvfac_dq, -dvfac_dq]),  # ← 부호 반대!
+                'dvfac_dv': torch.stack([dvfac_dv, -dvfac_dv]),  # ← 부호 반대!
+                'dforce_dq': dforce_dq   # hybrid J will combine them with λ, β
+            }
+            return cnt, geom_grad
+
         # Initialize z
         q = q_free.clone().detach().requires_grad_(True)
         v = vk.clone().detach().requires_grad_(True)
@@ -276,19 +359,47 @@ class StepSquarePosIPFn(torch.autograd.Function):
         z = torch.cat([q, v, lamN.view(1), beta, r.view(1), y.view(1), s.view(1), w])
 
         J_last = None
+        newton_iters = 0
         with torch.no_grad():
             # Newton on R(z)=0 (same as your current code, compact)
             for _ in range(int(max_newton)):
+                newton_iters += 1
                 R = residual(z)  # pure numeric, no graph
+                ### <- expected position for compute_geom_grads
                 if float(torch.linalg.norm(R)) < float(tol):
                     break
-
+                
                 # Build Jacobian: analytical or autograd
-                if use_analytical_jacobian:
+                if jacobian_type == "analytical":
                     # Use analytical Jacobian computation
                     _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
-                    J = analytical_jac.compute_jacobian(z, R,
+                    J = analytical_jacobian.compute_jacobian(z, R,
                         pusher_pos=pusher_pos_next
+                    )
+                    J_last = J.detach()
+                    
+                elif jacobian_type == "hybrid":
+                    # Use hybrid Jacobian computation
+                    z_req = z.detach().requires_grad_(True)
+                    _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z_req)
+                    with torch.enable_grad():
+                        q_req = _q.detach().clone().requires_grad_(True)
+                        v_req = _v.detach().clone().requires_grad_(True)
+                        lamN_req = _lamN.detach().clone().requires_grad_(False)
+                        beta_req = _beta.detach().clone().requires_grad_(False)
+
+                        cnt, geom_grads = compute_geom_grads(
+                            q_req, v_req, lamN_req, beta_req, pusher_pos_next, u_push, halfT
+                        )
+
+                    # Now compute hybrid Jacobian using this geometry info
+                    J = hybrid_jacobian.compute_jacobian(
+                        z_req,
+                        qk=qk,
+                        vk=vk,
+                        u=u_push,
+                        cnt=cnt,
+                        geom_grads=geom_grads,
                     )
                     J_last = J.detach()
                 else:
@@ -355,11 +466,33 @@ class StepSquarePosIPFn(torch.autograd.Function):
                     z = z_trial.detach()
         if J_last is None:
             # Compute final Jacobian: analytical or autograd
-            if use_analytical_jacobian:
-                _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
-                J = analytical_jac.compute_jacobian(z, R,
+            _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
+            if jacobian_type == "analytical":
+                
+                J = analytical_jacobian.compute_jacobian(z, R,
                         pusher_pos=pusher_pos_next
                     )
+                J_last = J.detach()
+            elif jacobian_type == "hybrid":
+                with torch.enable_grad():
+                        q_req = _q.detach().clone().requires_grad_(True)
+                        v_req = _v.detach().clone().requires_grad_(True)
+                        lamN_req = _lamN.detach().clone().requires_grad_(False)
+                        beta_req = _beta.detach().clone().requires_grad_(False)
+
+                        cnt, geom_grads = compute_geom_grads(
+                            q_req, v_req, lamN_req, beta_req, pusher_pos_next, u_push, halfT
+                        )
+
+                # Now compute hybrid Jacobian using this geometry info
+                J = hybrid_jacobian.compute_jacobian(
+                    z,
+                    qk=qk,
+                    vk=vk,
+                    u=u_push,
+                    cnt=cnt,
+                    geom_grads=geom_grads,
+                )
                 J_last = J.detach()
             else:
                 # Use PyTorch autograd (original method)
@@ -402,7 +535,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
             q_next.detach(), v_next.detach(),
             qk, vk, pusher_pos, u_push, hT, mT, IzzT, halfT, muT
         )
-
+        print(f"IPM converged in {newton_iters} iterations.")
         return q_next, v_next, pusher_pos_next, lam_vec, phi
 
 
@@ -616,15 +749,17 @@ def step_square_pos_ip(
     mu: torch.Tensor,
     ipm_opts: IPMOptions,
     skip_solving_threshold: float,
-    use_analytical_jacobian: bool = False,  # NEW PARAMETER
+    jacobian_type: string = "autograd",  # NEW PARAMETER
     ):
     """
     Wrapper with the same outputs as your original step() but with
     implicit (IFT) gradients instead of backprop through iterations.
     
     Args:
-        use_analytical_jacobian: If True, use analytical Jacobian computation.
-                                 If False, use PyTorch autograd (default).
+        jacobian_type: 
+            "analytical" : Use analytical Jacobian computation.
+            "hybrid" : Use hybrid Jacobian computation (analytical + autograd).
+            "autograd" : Use PyTorch autograd (default).
     """
     return StepSquarePosIPFn.apply(
         qk, vk, pusher_pos, u_push,
@@ -639,7 +774,7 @@ def step_square_pos_ip(
         torch.tensor(getattr(ipm_opts, "c_lin", 0.0), device=qk.device, dtype=qk.dtype),
         torch.tensor(getattr(ipm_opts, "c_ang", 0.0), device=qk.device, dtype=qk.dtype),
         torch.tensor(skip_solving_threshold, device=qk.device, dtype=qk.dtype),
-        torch.tensor(use_analytical_jacobian, device=qk.device, dtype=torch.bool),  # NEW
+        jacobian_type,  # NEW
     )
 
 
