@@ -244,7 +244,7 @@ def _sdf_box_smoothed(p_local, half, eps=1e-6):
 def obb_contact_blend2(
     q_xytheta: torch.Tensor,
     p_world: torch.Tensor,
-    half: float,
+    halfT: torch.Tensor,
     sharpness: float = 50.0,     # higher -> sharper switch between faces
     eps: float = 1e-8,           # numerical safety
     ) -> OBBContact:
@@ -270,13 +270,13 @@ def obb_contact_blend2(
     px, py = p_local[0], p_local[1]
 
     # Per-face closest points in local frame
-    clamp_y = torch.clamp(py, -half, half)
-    clamp_x = torch.clamp(px, -half, half)
+    clamp_y = torch.clamp(py, -halfT, halfT)
+    clamp_x = torch.clamp(px, -halfT, halfT)
     cp_locals = torch.stack([
-        torch.stack([ torch.tensor( half, dtype=p_world.dtype, device=p_world.device), clamp_y]),  # +x face
-        torch.stack([ torch.tensor(-half, dtype=p_world.dtype, device=p_world.device), clamp_y]),  # -x face
-        torch.stack([ clamp_x,  torch.tensor( half, dtype=p_world.dtype, device=p_world.device)]), # +y face
-        torch.stack([ clamp_x,  torch.tensor(-half, dtype=p_world.dtype, device=p_world.device)]), # -y face
+        torch.stack([ halfT, clamp_y]),  # +x face
+        torch.stack([ -halfT, clamp_y]),  # -x face
+        torch.stack([ clamp_x,  halfT]), # +y face
+        torch.stack([ clamp_x,  -halfT]), # -y face
     ])  # (4,2)
 
     # Per-face outward normals (local)
@@ -330,7 +330,7 @@ def obb_contact_blend2(
     t_world  = t_world / (torch.linalg.norm(t_world) + eps)
 
     # Smoothed signed distance (separate from the pairwise blend so the sign/magnitude is robust)
-    phi = _sdf_box_smoothed(p_local, half, eps=1e-6)
+    phi = _sdf_box_smoothed(p_local, halfT, eps=1e-6)
 
     r_cp = cp_world - c
 
