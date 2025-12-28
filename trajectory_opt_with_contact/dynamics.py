@@ -358,7 +358,8 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 skip_solving_threshold=float(skip_solving_threshold),
                 solved=False,
             )
-            print("Skipping implicit solve (no contact).")
+            # print("Skipping implicit solve (no contact).")
+            debugOut.append(steplog) if debugOut is not None and modeAEnabled else None
             return q_next, v_next, pusher_pos_next, lam_vec, phi, z_prev
 
         # ============ Define residual R(z) ============
