@@ -188,8 +188,8 @@ class TrajectoryVisualizer:
         def animate(i):
             # Update object
             x, y, th = traj[i]
-            box.set_xy((x - self.half, y - self.half))
-            box.angle = th * 180.0 / math.pi
+            t = mtransforms.Affine2D().rotate(th).translate(x, y)
+            box.set_transform(t + ax.transData)
             
             # Update pusher
             robot.center = (pusher_traj[i, 0], pusher_traj[i, 1])
@@ -272,7 +272,7 @@ class TrajectoryVisualizer:
         
         # 5. Friction cone check
         ax = axes[1, 1]
-        mu = 0.6  # Friction coefficient
+        mu = 0.5  # Friction coefficient
         friction_ratio = np.abs(forces[:, 1]) / (forces[:, 0] + 1e-6)
         ax.plot(time, friction_ratio, 'c-', linewidth=2, label='|λ_t| / λ_n')
         ax.axhline(y=mu, color='r', linestyle='--', linewidth=2, label=f'μ = {mu}')

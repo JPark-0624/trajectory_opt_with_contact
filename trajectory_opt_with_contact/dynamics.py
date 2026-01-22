@@ -338,7 +338,13 @@ class StepSquarePosIPFn(torch.autograd.Function):
         cnt_free = obb_contact_blend2(q_free, pusher_pos_next, halfT)   # user-provided
         if cnt_free.phi > skip_solving_threshold:
             # no-contact branch: semi-implicit Euler with mild damping
-            v_next = vk - 0.3 * vk * hT
+            c_lin_coeff = c_linT / mT if enable_viscous_ground_friction else torch.tensor(0.0, dtype=dtype, device=device)
+            c_ang_coeff = c_angT / IzzT if enable_viscous_ground_friction else torch.tensor(0.0, dtype=dtype, device=device)
+            v_next = torch.stack([
+                vk[0] - c_lin_coeff * vk[0] * hT,
+                vk[1] - c_lin_coeff * vk[1] * hT,
+                vk[2] - c_ang_coeff * vk[2] * hT,
+            ])
             q_next = qk + hT * v_next
             lam_vec = torch.zeros(2, dtype=dtype, device=device)
             phi = cnt_free.phi
@@ -358,9 +364,25 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 skip_solving_threshold=float(skip_solving_threshold),
                 solved=False,
             )
+
+            if z_prev is not None:
+                beta = z_prev[7:9].clone().detach().requires_grad_(True)
+                r = z_prev[9].clone().detach().requires_grad_(True)
+                y = z_prev[10].clone().detach().requires_grad_(True)
+                s = z_prev[11].clone().detach().requires_grad_(True)
+                w = z_prev[12:14].clone().detach().requires_grad_(True)
+            else:
+                beta = torch.full((2,), 1e-6, dtype=dtype, device=device, requires_grad=True)
+                r = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
+                y = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+                s = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+                w = torch.full((2,), max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+
+            z_next = torch.cat([q_next, v_next, lam_vec, beta, r.view(1), y.view(1), s.view(1), w])
+
             # print("Skipping implicit solve (no contact).")
             debugOut.append(steplog) if debugOut is not None and modeAEnabled else None
-            return q_next, v_next, pusher_pos_next, lam_vec, phi, z_prev
+            return q_next, v_next, pusher_pos_next, lam_vec, phi, None
 
         # ============ Define residual R(z) ============
         def unpack(z):
@@ -491,8 +513,8 @@ class StepSquarePosIPFn(torch.autograd.Function):
             s = z_prev[11].clone().detach().requires_grad_(True)
             w = z_prev[12:14].clone().detach().requires_grad_(True)
         else:
-            lamN = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
-            beta = torch.full((2,), 1e-3, dtype=dtype, device=device, requires_grad=True)
+            lamN = torch.tensor(1e-6, dtype=dtype, device=device, requires_grad=True)
+            beta = torch.full((2,), 1e-6, dtype=dtype, device=device, requires_grad=True)
             r = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
             y = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
             s = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
@@ -668,6 +690,15 @@ class StepSquarePosIPFn(torch.autograd.Function):
          qk, vk, pusher_pos, u_push, hT, mT, IzzT, halfT, muT) = ctx.saved_tensors
         C = ctx.constants
 
+        device = qk.device
+        dtype  = qk.dtype
+
+        # declare tensor variables outside of residual to prevent multiple computation
+        target_muT = asTensor(C["target_mu"], dtype=dtype, device=device)
+        M_inv = torch.diag(torch.stack([1.0/mT, 1.0/mT, 1.0/IzzT])) 
+        c_linT = asTensor(C["c_lin"], dtype=dtype, device=device)
+        c_angT = asTensor(C["c_ang"], dtype=dtype, device=device)
+
         # If we skipped solve, gradients flow through explicit formulas only
         if not C["solved"]:
             # Upstream grads may be None if those outputs weren't used; make them zeros
@@ -682,12 +713,19 @@ class StepSquarePosIPFn(torch.autograd.Function):
             # q_next = qk + hT * v_next = qk + (hT - 0.3*hT^2) * vk
             # pusher_pos_next = pusher_pos + hT * u_push
 
+            c_lin_coeff = c_linT / mT if C["enable_viscous_ground_friction"] else torch.tensor(0.0, dtype=qk.dtype, device=qk.device)
+            c_ang_coeff = c_angT / IzzT if C["enable_viscous_ground_friction"] else torch.tensor(0.0, dtype=qk.dtype, device=qk.device)
+
             one = torch.tensor(1.0, dtype=qk.dtype, device=qk.device)
-            coeff = (one - 0.3 * hT)              # scalar tensor
-            dv_dvk = coeff                        # ∂v_next/∂vk
-            dq_dvk = hT * coeff                   # ∂q_next/∂vk
-            dq_dh  = (one - 0.6 * hT) * vk        # ∂q_next/∂h
-            dv_dh  = (-0.3) * vk                  # ∂v_next/∂h
+            coeff_lin = (one - c_lin_coeff * hT)              # scalar tensor
+            coeff_ang = (one - c_ang_coeff * hT)              # scalar tensor
+            dv_dvk = torch.stack([coeff_lin, coeff_lin, coeff_ang])                        # ∂v_next/∂vk
+            dq_dvk = hT * dv_dvk                   # ∂q_next/∂vk
+
+            damping_vec = torch.stack([c_lin_coeff, c_lin_coeff, c_ang_coeff])
+
+            dq_dh  = (one - 2.0*damping_vec * hT) * vk        # ∂q_next/∂h
+            dv_dh  = (-damping_vec) * vk                  # ∂v_next/∂h
 
             # Gradients
             g_qk = gz_q                           # ∂q_next/∂qk = I
@@ -697,23 +735,12 @@ class StepSquarePosIPFn(torch.autograd.Function):
             g_h = (gz_pn @ u_push) + (gz_q @ dq_dh) + (gz_v @ dv_dh)
 
             # No grads w.r.t. m, Izz, half, mu, and all hyper-params in skip branch
-            return (
-                g_qk, g_vk, g_pusher, g_u,
-                None, None, None, None, None,
-                None, None, None, None, None, None, None,  # up to c_lin
-                None,  # c_lin
-                None,  # c_ang
-                None,  # skip_solving_threshold
-            )
+            return (g_qk, g_vk, g_pusher, g_u,
+                None, None, None, None, None, #g_h, g_m, g_Izz, g_half, g_mu,
+                None, None, None, None, None, None, None, None, None, # ipm options (target_mu, smooth_sdf, tol, max_newton, frac_to_boundary, ls_beta, enable_viscous_ground_friction, c_lin, c_ang)
+                None, None, None, None, None)  # skip_solving_threshold, jacobian type, z_prev, debug option, modeAConfig
 
-        device = qk.device
-        dtype  = qk.dtype
-
-        # declare tensor variables outside of residual to prevent multiple computation
-        target_muT = asTensor(C["target_mu"], dtype=dtype, device=device)
-        M_inv = torch.diag(torch.stack([1.0/mT, 1.0/mT, 1.0/IzzT])) 
-        c_linT = asTensor(C["c_lin"], dtype=dtype, device=device)
-        c_angT = asTensor(C["c_ang"], dtype=dtype, device=device)
+        
 
         # ---- Rebuild residual at (z*, params) with graph disabled for z ----
         def unpack(z):
@@ -863,7 +890,8 @@ class StepSquarePosIPFn(torch.autograd.Function):
         # The rest (non-tensor hyperparameters) have no gradients
         return (g_qk, g_vk, g_pusher, g_u,
                 None, None, None, None, None, #g_h, g_m, g_Izz, g_half, g_mu,
-                None, None, None, None, None, None, None, None, None, None, None, None) 
+                None, None, None, None, None, None, None, None, None, # ipm options (target_mu, smooth_sdf, tol, max_newton, frac_to_boundary, ls_beta, enable_viscous_ground_friction, c_lin, c_ang)
+                None, None, None, None, None)  # skip_solving_threshold, jacobian type, z_prev, debug option, modeAConfig
 
 def step_square_pos_ip(
     qk: torch.Tensor,
@@ -939,7 +967,7 @@ def implicit_euler_defects(qk, vk, prk, uk,
     return r, lam, phi
 
 def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy, 
-            w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
+            w_target = 20.0, w_orient = 1.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
             qp_solver = None, dynamics_solver=None, obstacle_pos=None, device=None):
     """
     Rollout a trajectory given control sequence.
@@ -985,7 +1013,7 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     qs = [q0]
     qrobot_hist = [pr0]
     obs_term = 0.0
-    
+    z_prev = None
     # Simulate forward
     for k in range(horizon):
         if dynamics_solver == 'LCP':
@@ -994,14 +1022,16 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
                 qp_solver=qp_solver, alpha_stab=0.1, device=device
             )
         elif dynamics_solver == 'IP':
-            q, v, pr, lamk, phik = step_square_pos_ip(
+            q, v, pr, lamk, phik, z_prev = step_square_pos_ip(
                 q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
-                skip_solving_threshold = 0.3,
-                ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-3, smooth_sdf=50.0, #smooth_sdf is unused
+                skip_solving_threshold = 0.003,
+                ipm_opts=IPMOptions(target_mu=1e-6, max_newton=20, tol=1e-3, smooth_sdf=50.0, #smooth_sdf is unused
                     enable_viscous_ground_friction=True,
-                    c_lin=8.0,          
-                    c_ang=8.0 * half     
-                    ))
+                    c_lin=1.0,
+                    c_ang=0.00667 ### c_ang = c_lin * (Izz/m)
+                    ),
+                z_prev=z_prev
+                )
 
         lambdas.append(lamk)
         phis.append(phik)
@@ -1015,12 +1045,19 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     obs_term /= horizon
     
     # Cost function
-    goal_term = w_target * torch.sum((q - goal_xy) ** 2)      # Goal reaching
-    ctrl_term = w_ctrl * torch.sum((u_seq*h) ** 2)               # Control effort
+    pos_error = q[:2] - goal_xy[:2]
+    theta_error = q[2] - goal_xy[2]
+    theta_error = torch.atan2(torch.sin(theta_error), torch.cos(theta_error))  # wrap to [-pi, pi]
+
+    goal_term = w_target * (torch.sum(pos_error **2))      # Goal reaching
+    orient_term = w_orient * (theta_error ** 2)            # Orientation error
+    
+    ctrl_term = w_ctrl * torch.sum((u_seq)**2)
+
     v_term = w_v * torch.sum(v ** 2)                       # Terminal velocity
     pen_term = 0.0  # Penetration penalty (disabled)
     
-    loss = goal_term + ctrl_term + pen_term + v_term + obs_term
+    loss = goal_term + orient_term + ctrl_term + pen_term + v_term + obs_term
     
     return loss, q, torch.stack(lambdas), torch.stack(phis), torch.stack(qs), torch.stack(qrobot_hist),\
-        goal_term, ctrl_term, v_term, obs_term, pen_term
+        goal_term, orient_term, ctrl_term, v_term, obs_term, pen_term
