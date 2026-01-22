@@ -15,19 +15,19 @@ print("="*60)
 
 # Create optimizer (matching original parameters)
 
-TO_solver = 'shooting'
-dynamics_solver = 'IP' #'LCP'
-obs = 'obs'
+TO_solver = 'shooting' #'iLQR' #
+dynamics_solver = 'IP' #'LCP' ##
+obs = 'obs' #'' #
 
 print("\nCreating optimizer...")
 optimizer = TrajectoryOptimizer(
-    mass=1.0, side_length=0.2, mu=0.6,
-    horizon=30, dt=0.05,
+    mass=1.0, side_length=0.2, mu=0.5,
+    horizon=100, dt=0.05,
     device='cuda' if torch.cuda.is_available() else 'cpu',
     TO_solver=TO_solver,
     dynamics_solver=dynamics_solver, #'LCP',
+    use_second_order=True,  
     # ALM params
-    use_second_order=True,         # LBFGS solver for Augmented Lagrangian
     alm_enabled=True,
     alm_rho_init=1e2,
     alm_target_tol=1e-6,
@@ -38,12 +38,31 @@ optimizer = TrajectoryOptimizer(
 print(f"Using device: {optimizer.device}")
 
 # Define problem (matching original main.py)
+### diagonal push set
 q0 = [0.0, 0.0, 0.0]
 v0 = [0.0, 0.0, 0.0]
 pusher0 = [0.3, -0.3]
 goal = [-0.2, 0.5, -0.3]
-obstacle = [0.2, -0.2]  # Obstacle position from original code
-u_init = [[-0.2, 0.2]] * optimizer.horizon  # Initial guess from original code
+
+
+# ### x-axis push set
+# q0 = [0.0, 0.0, 0.0]
+# v0 = [0.0, 0.0, 0.0]
+# pusher0 = [-0.3, 0.0]
+# goal = [0.5, 0.0, 0.0]
+
+
+#obstacle = [0.2, -0.2]#None #  # Obstacle position from original code
+obstacle = None
+#u_init = [[-0.2, 0.2]] * optimizer.horizon  # Initial guess from original code
+u_init = optimizer.compute_geometric_initial_trajectory(
+        robot_pos=pusher0,      # [x, y] - initial robot position
+        box_pos=q0,        # [x, y] - initial box position
+        goal_pos=goal,       # [x, y] - goal position (only x, y used)
+        )
+# u_init = [[0.2,0.0]] * optimizer.horizon  # Override with a simple initial guess (push to the right)
+
+# u_init = [[-0.15, 0.15]] * optimizer.horizon  # Initial guess from original code
 
 
 print(f"\nInitial pose: {q0}")
@@ -57,11 +76,12 @@ result = optimizer.optimize(
     v0=v0,
     pusher0=pusher0,
     goal=goal,
+    w_target = 20, w_v = 1.0, w_ctrl =0.01, w_obs = 0,
     u_init=u_init,
-    max_iters= 100, #100,
-    lr=0.05,
-    lr_decay_step=10,
-    lr_decay_gamma=0.8,
+    max_iters= 100, #100, #iLQR doesn't need any many iterations
+    lr=0.01, #0.05,
+    lr_decay_step=20, #10,
+    lr_decay_gamma=0.5, #0.5, # 0.8,
     obstacle_pos=obstacle,
     verbose=True
 )

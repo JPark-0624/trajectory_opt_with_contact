@@ -5,9 +5,11 @@ Implements time-stepping for rigid body dynamics with frictional contact
 using differentiable QP solvers.
 """
 
+import string
 import torch
 from .geometry import contact_frame_and_J, contact_jacobians, perp, _linearize_obb_gap_at
 from .qp_solver import ContactQPSolver
+from .analytical_jacobian import AnalyticalJacobian, HybridJacobian
 from dataclasses import dataclass
 from icecream import ic
 
@@ -108,6 +110,88 @@ def step_square(q, v, pusher_pos, u_push, h, m, Izz, half, mu,
 
 from .geometry import obb_contact, obb_contact_blend2
 
+def safeSolve(A, b, reg=1e-8):
+    """Try to solve (A+regI)x=b and fallback to lstsq on failure."""
+    I = torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+    Ar = A + reg * I
+    try:
+        return torch.linalg.solve(Ar, b)
+    except RuntimeError:
+        x, *_ = torch.linalg.lstsq(Ar, b)
+        return x
+
+def buildAutogradJacobian(residualFn, z, vectorize=True):
+    """Convert R(z) autograd jacobian to (m,n) Matrix."""
+    zReq = z.detach().requires_grad_(True)
+    with torch.enable_grad():
+        J = torch.autograd.functional.jacobian(
+            residualFn,
+            zReq,
+            strict=False,
+            create_graph=False,
+            vectorize=vectorize,
+        )
+    R = residualFn(z)  # shape 확인용
+    return J.reshape(R.numel(), zReq.numel()).detach()
+
+def fracToBoundaryAlpha(x, dx, tau):
+    """
+    return maximum alpha who satisfies x + alpha*dx >= (1-tau)*x
+    """
+    with torch.no_grad():
+        mask = dx < 0
+        if torch.any(mask):
+            # (1-tau)x - x = -tau*x
+            al = (-tau * x[mask]) / dx[mask]
+            a = torch.min(al).item()
+            return max(min(0.99 * a, 1.0), 1e-6)
+        return 1.0
+
+def computePositivityAlpha(z, dz, tau):
+    """alpha_pos calculation for positivity of lamN, beta, r, y, s, w."""
+
+    with torch.no_grad():
+        alphaPos = 1.0
+        lamN = z[6].view(1);     dLamN = dz[6].view(1)
+        beta = z[7:9];           dBeta = dz[7:9]
+        r = z[9].view(1);        dR = dz[9].view(1)
+        y = z[10].view(1);       dY = dz[10].view(1)
+        s = z[11].view(1);       dS = dz[11].view(1)
+        w = z[12:14];            dW = dz[12:14]
+
+        for x, dx in [(lamN, dLamN), (beta, dBeta), (r, dR), (y, dY), (s, dS), (w, dW)]:
+            alphaPos = min(alphaPos, fracToBoundaryAlpha(x, dx, tau))
+        return float(alphaPos)
+
+def clampPositive(z):
+    """solver clamp."""
+    z = z.clone()
+    z[6] = torch.clamp(z[6], min=1e-12)
+    z[7:9] = torch.clamp(z[7:9], min=1e-12)
+    z[9] = torch.clamp(z[9], min=1e-12)
+    z[10] = torch.clamp(z[10], min=1e-12)
+    z[11] = torch.clamp(z[11], min=1e-12)
+    z[12:14] = torch.clamp(z[12:14], min=1e-12)
+    return z
+
+def backtrackingLineSearch(residualFn, z, dz, alphaInit, lsBeta, maxSteps=15, c1=1e-4):
+    """Extracted backtracking logic from forward."""
+    with torch.no_grad():
+        R0 = residualFn(z)
+        n0 = torch.linalg.norm(R0)
+        alpha = float(alphaInit)
+        zTrialLast = None
+
+        for _ in range(maxSteps):
+            zTrial = clampPositive(z + alpha * dz)
+            zTrialLast = zTrial
+            Rt = residualFn(zTrial)
+            if torch.linalg.norm(Rt) <= (1.0 - c1 * alpha) * n0:
+                return zTrial.detach(), alpha, True
+            alpha *= float(lsBeta)
+
+        return zTrialLast.detach(), alpha, False
+
 @dataclass
 class IPMOptions:
     target_mu: float = 1e-4       # prescribed duality gap for each complementarity pair
@@ -132,6 +216,15 @@ def fraction_to_boundary_step(x: torch.Tensor, dx: torch.Tensor, frac: float) ->
         return float(torch.clamp(step, max=1.0).item())
     return 1.0
 
+def asTensor(x, *, dtype, device, requires_grad=False):
+    if torch.is_tensor(x):
+        t = x.to(device=device, dtype=dtype)
+        if requires_grad:
+            t = t.detach().clone().requires_grad_(True)
+        return t
+    return torch.tensor(x, device=device, dtype=dtype, requires_grad=requires_grad)
+
+
 class StepSquarePosIPFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx,
@@ -140,21 +233,99 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 target_mu, smooth_sdf, tol, max_newton,
                 frac_to_boundary, ls_beta,
                 enable_viscous_ground_friction, c_lin, c_ang,
-                skip_solving_threshold):
+                skip_solving_threshold,
+                z_prev,
+                jacobian_type,
+                debugOut=None,
+                modeAConfig=None):  
         """
         All differentiable arguments must be tensors.
         Scalars like m, Izz, half, mu can be tensors (dtype/shape-compatible).
         You can choose which ones require grad.
+        
+        Args:
+            jacobian_type: "analytical" for analytical Jacobian computation,
+                        "hybrid" for hybrid Jacobian computation (analytical + autograd),
+                        "autograd" for PyTorch autograd (default).
         """
         device = qk.device
         dtype = qk.dtype
 
-        # ---- Local copies (avoid in-graph ops for solver path) ----
-        hT   = torch.tensor(h, dtype=dtype, device=device, requires_grad=True)
-        muT  = torch.tensor(mu, dtype=dtype, device=device, requires_grad=True)
-        mT   =  torch.tensor(m, dtype=dtype, device=device, requires_grad=True)
-        IzzT =  torch.tensor(Izz, dtype=dtype, device=device, requires_grad=True)
-        halfT=  torch.tensor(half, dtype=dtype, device=device, requires_grad=True)
+        # ----------------
+        # Debug flags (Mode A)
+        # ----------------
+       
+        modeAEnabled = bool(modeAConfig and modeAConfig.get("enabled", False))
+        collectJacobians = bool(modeAConfig and modeAConfig.get("collect", "per_iter") == "per_iter")
+        steplog = None
+        if debugOut is not None and modeAEnabled:
+            steplog = {
+                "newton": [],
+                "jacobians": [] if collectJacobians else None,
+                "residuals": [] if collectJacobians else None, 
+                "z_stars": [] if collectJacobians else None,
+            }
+            print(f"\n{'='*60}")
+            print(f"Timestep {len(debugOut)}")
+            print(f"{'='*60}")
+            
+            if z_prev is not None:
+                print(f"✓ True warm start:")
+                print(f"  lambda_prev = {z_prev[6]:.6f}")
+                print(f"  beta_prev = [{z_prev[7]:.6f}, {z_prev[8]:.6f}]")
+            else:
+                print(f"✗ Cold start (z_prev is None)")
+                print(f"  lambda_init = 1e-3")
+
+
+        # patch : Juneil Park
+        # Convert scalar inputs to tensors at once
+        # to avoid multiple tensor declarations.
+        # all constants do not require grad.
+        hT   = asTensor(h, dtype=dtype, device=device)
+        muT  = asTensor(mu, dtype=dtype, device=device)
+        mT   = asTensor(m, dtype=dtype, device=device)
+        IzzT = asTensor(Izz, dtype=dtype, device=device)
+        halfT= asTensor(half, dtype=dtype, device=device)
+
+        target_muT = asTensor(target_mu, dtype=dtype, device=device)
+        # smooth_sdf, tol, max_newton, frac_to_boundary, ls_beta, enable_viscous_ground_friction does not need to be tensor
+        c_linT = asTensor(c_lin, dtype=dtype, device=device)
+        c_angT = asTensor(c_ang, dtype=dtype, device=device)
+
+        # Initialize analytical Jacobian computer if requested
+        
+        analytical_jacobian = None
+        hybrid_jacobian = None
+
+        if jacobian_type == "analytical":
+            analytical_jacobian = AnalyticalJacobian(
+                mass = m,
+                Izz = Izz,
+                half_length = half,
+                mu=mu,
+                h=h,
+                device=device,
+                dtype=dtype,
+                enable_viscous_ground_friction=enable_viscous_ground_friction,
+                c_lin=c_lin,
+                c_ang=c_ang
+            )
+        elif jacobian_type == "hybrid":
+            hybrid_jacobian = HybridJacobian(
+                mass = m,
+                Izz = Izz,
+                half_length = half,
+                mu=mu,
+                h=h,
+                device=device,
+                dtype=dtype,
+                enable_viscous_ground_friction=enable_viscous_ground_friction,
+                c_lin=c_lin,
+                c_ang=c_ang
+            )
+        elif jacobian_type == "autograd":
+            pass
 
         # Mass inverse
         M_inv = torch.diag(torch.stack([1.0/mT, 1.0/mT, 1.0/IzzT]))
@@ -167,24 +338,51 @@ class StepSquarePosIPFn(torch.autograd.Function):
         cnt_free = obb_contact_blend2(q_free, pusher_pos_next, halfT)   # user-provided
         if cnt_free.phi > skip_solving_threshold:
             # no-contact branch: semi-implicit Euler with mild damping
-            v_next = vk - 0.3 * vk * hT
+            c_lin_coeff = c_linT / mT if enable_viscous_ground_friction else torch.tensor(0.0, dtype=dtype, device=device)
+            c_ang_coeff = c_angT / IzzT if enable_viscous_ground_friction else torch.tensor(0.0, dtype=dtype, device=device)
+            v_next = torch.stack([
+                vk[0] - c_lin_coeff * vk[0] * hT,
+                vk[1] - c_lin_coeff * vk[1] * hT,
+                vk[2] - c_ang_coeff * vk[2] * hT,
+            ])
             q_next = qk + hT * v_next
             lam_vec = torch.zeros(2, dtype=dtype, device=device)
             phi = cnt_free.phi
 
             # Save for backward: needed to propagate grads (no implicit solve here)
             ctx.save_for_backward(
-                None, None, None, None,  # placeholders when no solve
+                None, None, None,  # placeholders when no solve
                 qk, vk, pusher_pos, u_push, hT, mT, IzzT, halfT, muT,
             )
+            # store constants - all python scalars
             ctx.constants = dict(
-                target_mu=target_mu, smooth_sdf=smooth_sdf, tol=tol, max_newton=max_newton,
-                frac_to_boundary=frac_to_boundary, ls_beta=ls_beta,
-                enable_viscous_ground_friction=enable_viscous_ground_friction,
-                c_lin=c_lin, c_ang=c_ang, skip_solving_threshold=skip_solving_threshold,
-                solved=False
+                target_mu=float(target_mu), smooth_sdf=float(smooth_sdf), tol=float(tol),
+                max_newton=int(max_newton),
+                frac_to_boundary=float(frac_to_boundary), ls_beta=float(ls_beta),
+                enable_viscous_ground_friction=bool(enable_viscous_ground_friction),
+                c_lin=float(c_lin), c_ang=float(c_ang),
+                skip_solving_threshold=float(skip_solving_threshold),
+                solved=False,
             )
-            return q_next, v_next, pusher_pos_next, lam_vec, phi
+
+            if z_prev is not None:
+                beta = z_prev[7:9].clone().detach().requires_grad_(True)
+                r = z_prev[9].clone().detach().requires_grad_(True)
+                y = z_prev[10].clone().detach().requires_grad_(True)
+                s = z_prev[11].clone().detach().requires_grad_(True)
+                w = z_prev[12:14].clone().detach().requires_grad_(True)
+            else:
+                beta = torch.full((2,), 1e-6, dtype=dtype, device=device, requires_grad=True)
+                r = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
+                y = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+                s = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+                w = torch.full((2,), max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+
+            z_next = torch.cat([q_next, v_next, lam_vec, beta, r.view(1), y.view(1), s.view(1), w])
+
+            # print("Skipping implicit solve (no contact).")
+            debugOut.append(steplog) if debugOut is not None and modeAEnabled else None
+            return q_next, v_next, pusher_pos_next, lam_vec, phi, None
 
         # ============ Define residual R(z) ============
         def unpack(z):
@@ -203,7 +401,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
 
             cnt = obb_contact_blend2(_q, pusher_pos_next, halfT)  # user-provided, differentiable
             n, t, r_cp = cnt.normal, cnt.tangent, cnt.r_cp
-            Jn, Jt = contact_jacobians(n, t, r_cp)               # user-provided
+            Jn, Jt = contact_jacobians(n, t, r_cp)      # user-provided
 
             # Tangential rel velocity at cp
             v_cp = _v[0:2] + _v[2] * perp(r_cp)
@@ -219,9 +417,9 @@ class StepSquarePosIPFn(torch.autograd.Function):
             Fg = torch.zeros(3, dtype=dtype, device=device)
             if enable_viscous_ground_friction and (c_lin > 0.0 or c_ang > 0.0):
                 Fg = torch.stack([
-                    torch.tensor(-c_lin, dtype=dtype, device=device) * _v[0],
-                    torch.tensor(-c_lin, dtype=dtype, device=device) * _v[1],
-                    torch.tensor(-c_ang, dtype=dtype, device=device) * _v[2],
+                    -c_linT* _v[0],
+                    -c_linT* _v[1],
+                    -c_angT* _v[2],
                 ])
 
             dv = M_inv @ (impulse + hT * Fg)
@@ -232,117 +430,274 @@ class StepSquarePosIPFn(torch.autograd.Function):
             r_cone = _s - (muT * _lamN - torch.sum(_beta))    # (1,)
             r_slip = _w - (v_facets + _r)                     # (2,)
 
-            mu_star = torch.tensor(target_mu, dtype=dtype, device=device)
-            r_c1 = _y * _lamN - mu_star
-            r_c2 = _r * _s - mu_star
-            r_c3 = _beta * _w - mu_star                       # (2,)
+            r_c1 = _y * _lamN - target_muT
+            r_c2 = _r * _s - target_muT
+            r_c3 = _beta * _w - target_muT                       # (2,)
 
             return torch.cat([r_dyn, r_kin, r_gap.view(1), r_cone.view(1), r_slip,
                               r_c1.view(1), r_c2.view(1), r_c3])
 
+        def compute_geom_grads(q, v, lamN, beta, pusher_pos, u_push, halfT):
+            """
+                Computes all geometry terms + their derivatives,
+                consistent with dynamics.py residual.
+                Uses autograd for all geometry derivatives.
+            """
+
+            # --- 1. Compute geometry (same as forward residual) ---
+            cnt = obb_contact_blend2(q, pusher_pos, halfT)
+            n  = cnt.normal
+            t  = cnt.tangent
+            r_cp = cnt.r_cp
+
+            # contact jacobians
+            Jn, Jt = contact_jacobians(n, t, r_cp)
+
+            # --- 2. phi(q) gradient ---
+            phi = cnt.phi
+            dphi_dq = torch.autograd.grad(phi, q, retain_graph=True)[0]
+
+            # --- 3. tangent relative velocity ---
+
+            perp_rcp = torch.stack([-r_cp[1], r_cp[0]])
+            v_cp = v[0:2] + v[2] * perp_rcp
+            v_rel = v_cp - u_push  # or v_push depending on your code
+            v_rel_t = torch.dot(t, v_rel)
+
+            # derivatives wrt q and v
+            dvfac_dq = torch.autograd.grad(v_rel_t, q, retain_graph=True)[0]
+            dvfac_dv = torch.autograd.grad(v_rel_t, v, retain_graph=True)[0]
+
+            # --- 4. contact impulse derivative wrt q ---
+                    
+            # force(q) = Jn(q)*lamN + Jt(q)*(beta0 - beta1)
+
+            lam = lamN
+            slip = beta[0] - beta[1]
+
+            def force_fn(q_local: torch.Tensor) -> torch.Tensor:
+                cnt_loc = obb_contact_blend2(q_local, pusher_pos, halfT)
+                n_loc, t_loc, r_cp_loc = cnt_loc.normal, cnt_loc.tangent, cnt_loc.r_cp
+                Jn_loc, Jt_loc = contact_jacobians(n_loc, t_loc, r_cp_loc)
+                force_loc = Jn_loc * lam + Jt_loc * slip   # (3,)
+                return force_loc
+
+            # dforce_dq: (3,3), row i: ∂force_i/∂q_j
+            dforce_dq = torch.autograd.functional.jacobian(
+                force_fn,
+                q,
+                vectorize=True,
+                create_graph=False
+            )                           # (3,3)
+
+            geom_grad = {
+                'cnt': cnt,
+                'Jn': Jn,
+                'Jt': Jt,
+                'dphi_dq': dphi_dq,
+                'dvfac_dq': torch.stack([dvfac_dq, -dvfac_dq]),  # ← 부호 반대!
+                'dvfac_dv': torch.stack([dvfac_dv, -dvfac_dv]),  # ← 부호 반대!
+                'dforce_dq': dforce_dq   # hybrid J will combine them with λ, β
+            }
+            return cnt, geom_grad
+
         # Initialize z
         q = q_free.clone().detach().requires_grad_(True)
         v = vk.clone().detach().requires_grad_(True)
-        lamN = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
-        beta = torch.full((2,), 1e-3, dtype=dtype, device=device, requires_grad=True)
-        r = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
-        y = torch.tensor(max(float(target_mu), 1e-4), dtype=dtype, device=device, requires_grad=True)
-        s = torch.tensor(max(float(target_mu), 1e-4), dtype=dtype, device=device, requires_grad=True)
-        w = torch.full((2,), max(float(target_mu), 1e-4), dtype=dtype, device=device, requires_grad=True)
+
+        if z_prev is not None:
+            lamN = z_prev[6].clone().detach().requires_grad_(True)
+            beta = z_prev[7:9].clone().detach().requires_grad_(True)
+            r = z_prev[9].clone().detach().requires_grad_(True)
+            y = z_prev[10].clone().detach().requires_grad_(True)
+            s = z_prev[11].clone().detach().requires_grad_(True)
+            w = z_prev[12:14].clone().detach().requires_grad_(True)
+        else:
+            lamN = torch.tensor(1e-6, dtype=dtype, device=device, requires_grad=True)
+            beta = torch.full((2,), 1e-6, dtype=dtype, device=device, requires_grad=True)
+            r = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
+            y = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+            s = torch.tensor(max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
+            w = torch.full((2,), max(target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
 
         z = torch.cat([q, v, lamN.view(1), beta, r.view(1), y.view(1), s.view(1), w])
 
-        # Newton on R(z)=0 (same as your current code, compact)
-        for _ in range(int(max_newton)):
-            z = z.detach().requires_grad_(True)
-            R = residual(z)
-            if float(torch.linalg.norm(R)) < float(tol):
-                break
-
-            J = torch.autograd.functional.jacobian(residual, z, strict=False, create_graph=False)
-            J = J.reshape(R.numel(), z.numel())
-
-            reg = 1e-8 * torch.eye(J.shape[0], dtype=dtype, device=device)
-            try:
-                dz = torch.linalg.solve(J + reg, -R)
-            except RuntimeError:
-                dz, *_ = torch.linalg.lstsq(J + reg, -R)
-
-            # fraction-to-boundary for positive vars
-            _q,_v,_lamN,_beta,_r,_y,_s,_w = (
-                z[0:3], z[3:6], z[6], z[7:9], z[9], z[10], z[11], z[12:14]
-            )
-            alpha_pos = 1.0
-            def frac_to_bd(x, dx, tau):
-                # find maximum alpha in (0,1] s.t. x + alpha*dx >= (1-tau)*x
-                with torch.no_grad():
-                    mask = dx < 0
-                    if torch.any(mask):
-                        al = ((1.0 - tau) * x[mask] - x[mask]) / dx[mask]
-                        a = torch.min(al).item()
-                        return max(min(0.99*a, 1.0), 1e-6)
-                    return 1.0
-            tau = float(frac_to_boundary)
-            for x, dx in [(_lamN.view(1), dz[6].view(1)),
-                          (_beta, dz[7:9]), (_r.view(1), dz[9].view(1)),
-                          (_y.view(1), dz[10].view(1)), (_s.view(1), dz[11].view(1)),
-                          (_w, dz[12:14])]:
-                alpha_pos = min(alpha_pos, frac_to_bd(x, dx, tau))
-            alpha = alpha_pos
-
-            # backtracking
-            good = False
-            for _ in range(15):
-                z_trial = z + alpha * dz
-                # clamp positivity
-                z_trial[6] = torch.clamp(z_trial[6], min=1e-12)
-                z_trial[7:9] = torch.clamp(z_trial[7:9], min=1e-12)
-                z_trial[9] = torch.clamp(z_trial[9], min=1e-12)
-                z_trial[10] = torch.clamp(z_trial[10], min=1e-12)
-                z_trial[11] = torch.clamp(z_trial[11], min=1e-12)
-                z_trial[12:14] = torch.clamp(z_trial[12:14], min=1e-12)
-
-                Rt = residual(z_trial)
-                if torch.linalg.norm(Rt) <= (1.0 - 1e-4 * alpha) * torch.linalg.norm(R):
-                    z = z_trial.detach()
-                    good = True
+        J_last = None
+        newton_iters = 0
+        with torch.no_grad():
+            # Newton on R(z)=0 (same as your current code, compact)
+            for _ in range(int(max_newton)):
+                newton_iters += 1
+                R = residual(z)  # pure numeric, no graph
+                Rn = float(torch.linalg.norm(R))
+                ### <- expected position for compute_geom_grads
+                if Rn < float(tol):
                     break
-                alpha *= ls_beta
-            if not good:
-                z = z_trial.detach()
+                
+                # Build Jacobian: analytical or autograd
+                if jacobian_type == "analytical":
+                    # Use analytical Jacobian computation
+                    _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
+                    J = analytical_jacobian.compute_jacobian(z, R,
+                        pusher_pos=pusher_pos_next
+                    )
+                    J_last = J.detach()
+                    
+                elif jacobian_type == "hybrid":
+                    # Use hybrid Jacobian computation
+                    z_req = z.detach().requires_grad_(True)
+                    _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z_req)
+                    with torch.enable_grad():
+                        q_req = _q.detach().clone().requires_grad_(True)
+                        v_req = _v.detach().clone().requires_grad_(True)
+                        lamN_req = _lamN.detach().clone().requires_grad_(False)
+                        beta_req = _beta.detach().clone().requires_grad_(False)
 
-        # Unpack solution
+                        cnt, geom_grads = compute_geom_grads(
+                            q_req, v_req, lamN_req, beta_req, pusher_pos_next, u_push, halfT
+                        )
+
+                    # Now compute hybrid Jacobian using this geometry info
+                    J = hybrid_jacobian.compute_jacobian(
+                        z_req,
+                        qk=qk,
+                        vk=vk,
+                        u=u_push,
+                        cnt=cnt,
+                        geom_grads=geom_grads,
+                    )
+                    J_last = J.detach()
+                else:
+                    # Use PyTorch autograd (original method)
+                    z_req = z.detach().requires_grad_(True)
+                    with torch.enable_grad():
+                        J = torch.autograd.functional.jacobian(
+                            residual,
+                            z_req,
+                            strict=False,
+                            create_graph=False,
+                            vectorize=True,  # <-- important
+                        )
+                    J = J.reshape(R.numel(), z_req.numel())
+                    J_last = J.detach()
+
+                if steplog is not None and collectJacobians:
+                    steplog["jacobians"].append(J_last.clone().cpu())
+                    steplog["residuals"].append(R.detach().clone().cpu())
+                    steplog["z_stars"].append(z.detach().clone().cpu())
+
+                dzFresh = safeSolve(J_last, -R)
+
+
+                tau = float(frac_to_boundary)
+                alpha_pos = computePositivityAlpha(z, dzFresh, tau)
+
+                # backtracking
+                zNew, alpha, ok = backtrackingLineSearch(
+                    residualFn=residual,
+                    z=z,
+                    dz=dzFresh,
+                    alphaInit=alpha_pos,
+                    lsBeta=ls_beta,
+                    maxSteps=15,
+                    c1=1e-4
+                )
+                z = zNew.detach()
+
+        if J_last is None:
+            # Compute final Jacobian: analytical or autograd
+            _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
+            if jacobian_type == "analytical":
+                
+                J = analytical_jacobian.compute_jacobian(z, R,
+                        pusher_pos=pusher_pos_next
+                    )
+                J_last = J.detach()
+            elif jacobian_type == "hybrid":
+                with torch.enable_grad():
+                        q_req = _q.detach().clone().requires_grad_(True)
+                        v_req = _v.detach().clone().requires_grad_(True)
+                        lamN_req = _lamN.detach().clone().requires_grad_(False)
+                        beta_req = _beta.detach().clone().requires_grad_(False)
+
+                        cnt, geom_grads = compute_geom_grads(
+                            q_req, v_req, lamN_req, beta_req, pusher_pos_next, u_push, halfT
+                        )
+
+                # Now compute hybrid Jacobian using this geometry info
+                J = hybrid_jacobian.compute_jacobian(
+                    z,
+                    qk=qk,
+                    vk=vk,
+                    u=u_push,
+                    cnt=cnt,
+                    geom_grads=geom_grads,
+                )
+                J_last = J.detach()
+            else:
+                # Use PyTorch autograd (original method)
+                z_req = z.detach().requires_grad_(True)
+                with torch.enable_grad():
+                    R = residual(z_req)
+                    J = torch.autograd.functional.jacobian(
+                        residual,
+                        z_req,
+                        strict=False,
+                        create_graph=False,
+                        vectorize=True,
+                    )
+                J_last = J.reshape(R.numel(), z_req.numel()).detach()
+
+        # at end of forward, after you have z and J_last
         q_next = z[0:3]
         v_next = z[3:6]
-        lamN = z[6]
-        beta = z[7:9]
-        y = z[10]
-        lam_t = beta[0] - beta[1]
+        lamN   = z[6]
+        beta   = z[7:9]
+        y      = z[10]
+        lam_t  = beta[0] - beta[1]
         lam_vec = torch.stack([lamN, lam_t])
-        phi = y
+        phi    = y
 
-        # Save for backward: we store just enough to rebuild J and do IFT
-        ctx.save_for_backward(
-            z.detach(),                           # z*
-            pusher_pos_next.detach(),             # pusher at k+1
-            q_next.detach(), v_next.detach(),     # outputs (z-part)
-            qk, vk, pusher_pos, u_push, hT, mT, IzzT, halfT, muT
-        )
+        # store constants - all python scalars
         ctx.constants = dict(
-            target_mu=float(target_mu), smooth_sdf=float(smooth_sdf), tol=float(tol), max_newton=int(max_newton),
+            target_mu=float(target_mu), smooth_sdf=float(smooth_sdf), tol=float(tol),
+            max_newton=int(max_newton),
             frac_to_boundary=float(frac_to_boundary), ls_beta=float(ls_beta),
             enable_viscous_ground_friction=bool(enable_viscous_ground_friction),
-            c_lin=float(c_lin), c_ang=float(c_ang), skip_solving_threshold=float(skip_solving_threshold),
-            solved=True
+            c_lin=float(c_lin), c_ang=float(c_ang),
+            skip_solving_threshold=float(skip_solving_threshold),
+            solved=True,
         )
-        return q_next, v_next, pusher_pos_next, lam_vec, phi
+
+        ctx.z_star = z.detach()
+        ctx.J = J_last  # (14, 14) dense tensor
+        ctx.save_for_backward(
+            pusher_pos_next.detach(),
+            q_next.detach(), v_next.detach(),
+            qk, vk, pusher_pos, u_push, hT, mT, IzzT, halfT, muT
+        )
+        
+        # print(f"  IPM converged in {newton_iters} iterations.")
+        debugOut.append(steplog) if debugOut is not None and modeAEnabled else None
+
+        return q_next, v_next, pusher_pos_next, lam_vec, phi, z.detach()
+
 
     @staticmethod
-    def backward(ctx, grad_q_next, grad_v_next, grad_pusher_pos_next, grad_lam_vec, grad_phi):
+    def backward(ctx, grad_q_next, grad_v_next, grad_pusher_pos_next, grad_lam_vec, grad_phi, grad_z_star=None):
         # Retrieve
-        (z_star, pusher_pos_next, q_next, v_next,
+        (pusher_pos_next, q_next, v_next,
          qk, vk, pusher_pos, u_push, hT, mT, IzzT, halfT, muT) = ctx.saved_tensors
         C = ctx.constants
+
+        device = qk.device
+        dtype  = qk.dtype
+
+        # declare tensor variables outside of residual to prevent multiple computation
+        target_muT = asTensor(C["target_mu"], dtype=dtype, device=device)
+        M_inv = torch.diag(torch.stack([1.0/mT, 1.0/mT, 1.0/IzzT])) 
+        c_linT = asTensor(C["c_lin"], dtype=dtype, device=device)
+        c_angT = asTensor(C["c_ang"], dtype=dtype, device=device)
 
         # If we skipped solve, gradients flow through explicit formulas only
         if not C["solved"]:
@@ -358,12 +713,19 @@ class StepSquarePosIPFn(torch.autograd.Function):
             # q_next = qk + hT * v_next = qk + (hT - 0.3*hT^2) * vk
             # pusher_pos_next = pusher_pos + hT * u_push
 
+            c_lin_coeff = c_linT / mT if C["enable_viscous_ground_friction"] else torch.tensor(0.0, dtype=qk.dtype, device=qk.device)
+            c_ang_coeff = c_angT / IzzT if C["enable_viscous_ground_friction"] else torch.tensor(0.0, dtype=qk.dtype, device=qk.device)
+
             one = torch.tensor(1.0, dtype=qk.dtype, device=qk.device)
-            coeff = (one - 0.3 * hT)              # scalar tensor
-            dv_dvk = coeff                        # ∂v_next/∂vk
-            dq_dvk = hT * coeff                   # ∂q_next/∂vk
-            dq_dh  = (one - 0.6 * hT) * vk        # ∂q_next/∂h
-            dv_dh  = (-0.3) * vk                  # ∂v_next/∂h
+            coeff_lin = (one - c_lin_coeff * hT)              # scalar tensor
+            coeff_ang = (one - c_ang_coeff * hT)              # scalar tensor
+            dv_dvk = torch.stack([coeff_lin, coeff_lin, coeff_ang])                        # ∂v_next/∂vk
+            dq_dvk = hT * dv_dvk                   # ∂q_next/∂vk
+
+            damping_vec = torch.stack([c_lin_coeff, c_lin_coeff, c_ang_coeff])
+
+            dq_dh  = (one - 2.0*damping_vec * hT) * vk        # ∂q_next/∂h
+            dv_dh  = (-damping_vec) * vk                  # ∂v_next/∂h
 
             # Gradients
             g_qk = gz_q                           # ∂q_next/∂qk = I
@@ -373,17 +735,12 @@ class StepSquarePosIPFn(torch.autograd.Function):
             g_h = (gz_pn @ u_push) + (gz_q @ dq_dh) + (gz_v @ dv_dh)
 
             # No grads w.r.t. m, Izz, half, mu, and all hyper-params in skip branch
-            return (
-                g_qk, g_vk, g_pusher, g_u,
-                None, None, None, None, None,
-                None, None, None, None, None, None, None,  # up to c_lin
-                None,  # c_lin
-                None,  # c_ang
-                None,  # skip_solving_threshold
-            )
+            return (g_qk, g_vk, g_pusher, g_u,
+                None, None, None, None, None, #g_h, g_m, g_Izz, g_half, g_mu,
+                None, None, None, None, None, None, None, None, None, # ipm options (target_mu, smooth_sdf, tol, max_newton, frac_to_boundary, ls_beta, enable_viscous_ground_friction, c_lin, c_ang)
+                None, None, None, None, None)  # skip_solving_threshold, jacobian type, z_prev, debug option, modeAConfig
 
-        device = qk.device
-        dtype  = qk.dtype
+        
 
         # ---- Rebuild residual at (z*, params) with graph disabled for z ----
         def unpack(z):
@@ -399,7 +756,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
 
         def residual(z, qk_, vk_, pusher_pos_, u_push_, h_, m_, Izz_, half_, mu_):
             # Same as in forward (keep params explicit)
-            M_inv = torch.diag(torch.stack([1.0/m_, 1.0/m_, 1.0/Izz_]))
+            
             pusher_next = pusher_pos_ + h_ * u_push_
 
             _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
@@ -418,9 +775,9 @@ class StepSquarePosIPFn(torch.autograd.Function):
             Fg = torch.zeros(3, dtype=dtype, device=device)
             if C["enable_viscous_ground_friction"] and (C["c_lin"] > 0.0 or C["c_ang"] > 0.0):
                 Fg = torch.stack([
-                    torch.tensor(-C["c_lin"], dtype=dtype, device=device) * _v[0],
-                    torch.tensor(-C["c_lin"], dtype=dtype, device=device) * _v[1],
-                    torch.tensor(-C["c_ang"], dtype=dtype, device=device) * _v[2],
+                    -c_linT * _v[0],
+                    -c_linT * _v[1],
+                    -c_angT * _v[2],
                 ])
 
             dv = M_inv @ (impulse + h_ * Fg)
@@ -431,10 +788,10 @@ class StepSquarePosIPFn(torch.autograd.Function):
             r_cone = _s - (mu_ * _lamN - torch.sum(_beta))
             r_slip = _w - (v_facets + _r)
 
-            mu_star = torch.tensor(C["target_mu"], dtype=dtype, device=device)
-            r_c1 = _y * _lamN - mu_star
-            r_c2 = _r * _s - mu_star
-            r_c3 = _beta * _w - mu_star
+
+            r_c1 = _y * _lamN - target_muT
+            r_c2 = _r * _s - target_muT
+            r_c3 = _beta * _w - target_muT
 
             return torch.cat([r_dyn, r_kin, r_gap.view(1), r_cone.view(1), r_slip,
                               r_c1.view(1), r_c2.view(1), r_c3])
@@ -455,15 +812,17 @@ class StepSquarePosIPFn(torch.autograd.Function):
             return q_next_, v_next_, pusher_next_, lam_vec_, phi_
 
         # Build J = dR/dz at solution
-        
+        z_star = ctx.z_star
+        J = ctx.J  # cached from forward, shape (nz, nz)
+        reg = 1e-8 * torch.eye(J.shape[0], dtype=dtype, device=device)
+
+        # we still need a grad-enabled copy of z_star for outputs_from:
         z_star_req = z_star.detach().requires_grad_(True)
         with torch.enable_grad():
-            R_star = residual(z_star_req, qk.detach(), vk.detach(), pusher_pos.detach(), u_push.detach(),
-                          hT.detach(), mT.detach(), IzzT.detach(), halfT.detach(), muT.detach())
-        J = torch.autograd.functional.jacobian(
-            lambda zz: residual(zz, qk.detach(), vk.detach(), pusher_pos.detach(), u_push.detach(),
-                                hT.detach(), mT.detach(), IzzT.detach(), halfT.detach(), muT.detach()),
-            z_star_req, strict=False, create_graph=False).reshape(R_star.numel(), z_star_req.numel())
+            qn, vn, pn, lamv, ph = outputs_from(
+                z_star_req, qk.detach(), vk.detach(),
+                pusher_pos.detach(), u_push.detach(), hT.detach()
+            )
         reg = 1e-8 * torch.eye(J.shape[0], dtype=dtype, device=device)
         # g_z^T * lambda  (lambda = upstream adjoints on outputs except pusher which is handled separately)
         with torch.enable_grad():
@@ -531,232 +890,56 @@ class StepSquarePosIPFn(torch.autograd.Function):
         # The rest (non-tensor hyperparameters) have no gradients
         return (g_qk, g_vk, g_pusher, g_u,
                 None, None, None, None, None, #g_h, g_m, g_Izz, g_half, g_mu,
-                None, None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, # ipm options (target_mu, smooth_sdf, tol, max_newton, frac_to_boundary, ls_beta, enable_viscous_ground_friction, c_lin, c_ang)
+                None, None, None, None, None)  # skip_solving_threshold, jacobian type, z_prev, debug option, modeAConfig
 
 def step_square_pos_ip(
     qk: torch.Tensor,
     vk: torch.Tensor,
     pusher_pos: torch.Tensor,
     u_push: torch.Tensor,
-    h: torch.Tensor,           # pass as tensor for gradient through time-step if desired
-    m: torch.Tensor,           # you can pass torch.tensor(m, dtype=..., device=...)
-    Izz: torch.Tensor,
-    half: torch.Tensor,
-    mu: torch.Tensor,
+    h: float,           # non tensor datatype. make tensor in forward at once.
+    m: float,           # non tensor datatype. make tensor in forward at once.
+    Izz: float,        # non tensor datatype. make tensor in forward at once.
+    half: float,       # non tensor datatype. make tensor in forward at once.
+    mu: float,        # non tensor datatype. make tensor in forward at once.
     ipm_opts: IPMOptions,
     skip_solving_threshold: float,
+    z_prev = None,
+    jacobian_type: string = "autograd",  # NEW PARAMETER
+    debugOut = None,
+    modeAConfig=None
     ):
     """
     Wrapper with the same outputs as your original step() but with
     implicit (IFT) gradients instead of backprop through iterations.
+    
+    Args:
+        jacobian_type: 
+            "analytical" : Use analytical Jacobian computation.
+            "hybrid" : Use hybrid Jacobian computation (analytical + autograd).
+            "autograd" : Use PyTorch autograd (default).
     """
     return StepSquarePosIPFn.apply(
         qk, vk, pusher_pos, u_push,
         h, m, Izz, half, mu,
-        torch.tensor(ipm_opts.target_mu, device=qk.device, dtype=qk.dtype),
-        torch.tensor(getattr(ipm_opts, "smooth_sdf", 0.0), device=qk.device, dtype=qk.dtype),
-        torch.tensor(ipm_opts.tol, device=qk.device, dtype=qk.dtype),
-        torch.tensor(ipm_opts.max_newton, device=qk.device, dtype=qk.dtype),
-        torch.tensor(ipm_opts.frac_to_boundary, device=qk.device, dtype=qk.dtype),
-        torch.tensor(ipm_opts.ls_beta, device=qk.device, dtype=qk.dtype),
-        torch.tensor(getattr(ipm_opts, "enable_viscous_ground_friction", False), device=qk.device, dtype=torch.bool),
-        torch.tensor(getattr(ipm_opts, "c_lin", 0.0), device=qk.device, dtype=qk.dtype),
-        torch.tensor(getattr(ipm_opts, "c_ang", 0.0), device=qk.device, dtype=qk.dtype),
-        torch.tensor(skip_solving_threshold, device=qk.device, dtype=qk.dtype),
+        ipm_opts.target_mu,
+        getattr(ipm_opts, "smooth_sdf", 0.0),
+        ipm_opts.tol,
+        ipm_opts.max_newton,
+        ipm_opts.frac_to_boundary,
+        ipm_opts.ls_beta,
+        getattr(ipm_opts, "enable_viscous_ground_friction", False),
+        getattr(ipm_opts, "c_lin", 0.0),
+        getattr(ipm_opts, "c_ang", 0.0),
+        skip_solving_threshold,
+        z_prev,
+        jacobian_type,
+        debugOut,
+        modeAConfig
     )
 
 
-# def step_square_pos_ip(
-#     qk: torch.Tensor,
-#     vk: torch.Tensor,
-#     pusher_pos: torch.Tensor,
-#     u_push: torch.Tensor,
-#     h: float,
-#     m: float,
-#     Izz: float,
-#     half: float,
-#     mu: float,
-#     skip_solving_threshold: float,
-#     ipm_opts: IPMOptions = IPMOptions(),
-#     device=None,
-#     ):
-#     """
-#     One-step implicit integration with *position-level* contact complementarity solved by interior point.
-
-#     Unknowns: q_{k+1}, v_{k+1}, \lambda_N, beta (2 facets), r (slack for |t|-cone),
-#               y (gap slack), s (cone slack), w (2 facet slips)
-
-#     Complementarity pairs forced to prescribed duality gap mu*: 
-#       y * lambda_N = mu*,   r * s = mu*,   beta_i * w_i = mu*.
-
-#     Normal gap uses position-level constraint y = phi(q_{k+1}, pusher_{k+1}).
-#     Tangential uses Anitescu linearized cone with two facets (\pm t).
-
-#     Returns: q_{k+1}, v_{k+1}, pusher_pos_{k+1}, lam_vec([lambda_N, lambda_t_total]), phi
-#     """
-#     if device is None:
-#         device = qk.device
-#     dtype = qk.dtype
-
-#     hT = torch.tensor(h, dtype=dtype, device=device)
-#     muT = torch.tensor(mu, dtype=dtype, device=device)
-
-#     # Mass inverse
-#     M_inv = torch.diag(torch.tensor([1.0 / m, 1.0 / m, 1.0 / Izz], dtype=dtype, device=device))
-
-#     # Kinematic pusher (known)
-#     pusher_pos_next = pusher_pos + hT * u_push
-
-#     # Quick free prediction to skip IP solve when well separated
-#     q_free = torch.stack([qk[0] + hT * vk[0], qk[1] + hT * vk[1], qk[2] + hT * vk[2]])
-#     # cnt_free = obb_contact(q_free, pusher_pos_next, half, smooth=ipm_opts.smooth_sdf)
-#     cnt_free = obb_contact_blend2(q_free, pusher_pos_next, half)
-#     if cnt_free.phi > skip_solving_threshold:
-#         # no contact; plain semi-implicit Euler with mild damping
-#         v_next = vk - 0.3 * vk * hT
-#         q_next = torch.stack([qk[0] + hT * v_next[0], qk[1] + hT * v_next[1], qk[2] + hT * v_next[2]])
-#         lam = torch.zeros(2, dtype=dtype, device=device)
-#         return q_next, v_next, pusher_pos_next, lam, cnt_free.phi
-
-#     # Unknowns initialization
-#     q = q_free.clone().requires_grad_(True)
-#     v = vk.clone().requires_grad_(True)
-
-#     lamN = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
-#     beta = torch.full((2,), 1e-3, dtype=dtype, device=device, requires_grad=True)  # two facets (+t,-t)
-#     r = torch.tensor(1e-3, dtype=dtype, device=device, requires_grad=True)
-
-#     y = torch.tensor(max(ipm_opts.target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
-#     s = torch.tensor(max(ipm_opts.target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
-#     w = torch.full((2,), max(ipm_opts.target_mu, 1e-4), dtype=dtype, device=device, requires_grad=True)
-
-#     def pack(_q, _v, _lamN, _beta, _r, _y, _s, _w):
-#         return torch.cat([_q, _v, _lamN.view(1), _beta, _r.view(1), _y.view(1), _s.view(1), _w])
-
-#     def unpack(z):
-#         _q = z[0:3]
-#         _v = z[3:6]
-#         _lamN = z[6]
-#         _beta = z[7:9]
-#         _r = z[9]
-#         _y = z[10]
-#         _s = z[11]
-#         _w = z[12:14]
-#         return _q, _v, _lamN, _beta, _r, _y, _s, _w
-
-#     def residual(z: torch.Tensor) -> torch.Tensor:
-#         _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
-
-#         # cnt = obb_contact(_q, pusher_pos_next, half, smooth=ipm_opts.smooth_sdf)
-#         cnt = obb_contact_blend2(_q, pusher_pos_next, half)
-#         n, t, r_cp = cnt.normal, cnt.tangent, cnt.r_cp
-#         Jn, Jt = contact_jacobians(n, t, r_cp)
-
-#         # Tangential relative velocity at cp (scalar along t)
-#         v_cp = _v[0:2] + _v[2] * perp(r_cp)
-#         v_rel_t = torch.dot(t, v_cp - u_push)
-
-#         # Two facet slip velocities: [ +v_t, -v_t ]
-#         v_facets = torch.stack([v_rel_t, -v_rel_t])
-
-#         # Dynamics (implicit Euler on velocities) and kinematics
-#         lamT_total = _beta[0] - _beta[1]
-#         impulse = Jn * _lamN + Jt * lamT_total
-
-#         # Option A: viscous ground friction as an external force ~ -C * v
-#         Fg = torch.zeros(3, dtype=dtype, device=device)
-#         if ipm_opts.enable_viscous_ground_friction and (ipm_opts.c_lin > 0.0 or ipm_opts.c_ang > 0.0):
-#             c_linT = torch.tensor(ipm_opts.c_lin, dtype=dtype, device=device)
-#             c_angT = torch.tensor(ipm_opts.c_ang, dtype=dtype, device=device)
-#             Fg = torch.stack([
-#                 -c_linT * _v[0],  # Fx
-#                 -c_linT * _v[1],  # Fy
-#                 -c_angT * _v[2],  # Tau
-#             ])
-
-#         # Forces must be multiplied by h to get an impulse; contact impulses already are
-#         dv = M_inv @ (impulse + hT * Fg)
-#         r_dyn = _v - vk - dv                     # (3,)
-#         r_kin = _q - qk - hT * _v                # (3,)
-
-#         # Equalities tying slacks to physical quantities
-#         r_gap = _y - cnt.phi                      # (1,)
-#         r_cone = _s - (muT * _lamN - torch.sum(_beta))  # (1,)
-#         r_slip = _w - (v_facets + _r)            # (2,)
-
-#         mu_star = torch.tensor(ipm_opts.target_mu, dtype=dtype, device=device)
-#         # Central-path complementarity (softened)
-#         r_c1 = _y * _lamN - mu_star              # (1,)
-#         r_c2 = _r * _s - mu_star                 # (1,)
-#         r_c3 = _beta * _w - mu_star              # (2,)
-
-#         return torch.cat([r_dyn, r_kin, r_gap.view(1), r_cone.view(1), r_slip, r_c1.view(1), r_c2.view(1), r_c3])
-
-#     # Newton iterations on R(z)=0
-#     z = pack(q, v, lamN, beta, r, y, s, w)
-
-#     for it in range(ipm_opts.max_newton):
-#         z = z.clone().detach().requires_grad_(True)
-#         R = residual(z) #.requires_grad_(True)
-#         res_norm = float(torch.linalg.norm(R).item())
-#         if res_norm < ipm_opts.tol:
-#             break
-#         # Dense Jacobian via autograd
-#         # J = []
-#         # for i in range(R.numel()):
-#         #     ic(R[i].requires_grad, z.requires_grad)
-#         #     (grad_i,) = torch.autograd.grad(R[i], z, retain_graph=True, create_graph=False, allow_unused=False)
-#         #     J.append(grad_i.view(1, -1))
-#         # J = torch.cat(J, dim=0)  # (N,N)
-
-#         J = torch.autograd.functional.jacobian(residual, z, strict=False, create_graph=False)
-#         J = J.reshape(R.numel(), z.numel())
-
-#         # Levenberg-style regularization for robustness
-#         reg = 1e-8 * torch.eye(J.shape[0], dtype=dtype, device=device)
-#         try:
-#             dz = torch.linalg.solve(J + reg, -R)
-#         except RuntimeError:
-#             # fallback to least-squares if singular
-#             dz, *_ = torch.linalg.lstsq(J + reg, -R)
-
-#         # Fraction-to-boundary for positivity variables
-#         _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
-#         alpha_pos = 1.0
-#         pos_vars = [(_lamN.view(1), dz[6].view(1)), (_beta, dz[7:9]), (_r.view(1), dz[9].view(1)),
-#                     (_y.view(1), dz[10].view(1)), (_s.view(1), dz[11].view(1)), (_w, dz[12:14])]
-#         for x, dx in pos_vars:
-#             alpha_pos = min(alpha_pos, fraction_to_boundary_step(x, dx, ipm_opts.frac_to_boundary))
-#         alpha = alpha_pos
-
-#         # Backtracking to reduce residual
-#         newton_decrease = False
-#         for _ in range(15):
-#             z_trial = z + alpha * dz
-#             # enforce tiny floors to stay >0
-#             z_trial[6] = torch.clamp(z_trial[6], min=1e-12)         # lamN
-#             z_trial[7:9] = torch.clamp(z_trial[7:9], min=1e-12)     # beta
-#             z_trial[9] = torch.clamp(z_trial[9], min=1e-12)         # r
-#             z_trial[10] = torch.clamp(z_trial[10], min=1e-12)       # y
-#             z_trial[11] = torch.clamp(z_trial[11], min=1e-12)       # s
-#             z_trial[12:14] = torch.clamp(z_trial[12:14], min=1e-12) # w
-#             Rt = residual(z_trial)
-#             if torch.linalg.norm(Rt) <= (1.0 - 1e-4 * alpha) * torch.linalg.norm(R):
-#                 z = z_trial.detach()
-#                 newton_decrease = True
-#                 break
-#             alpha *= ipm_opts.ls_beta
-#         if not newton_decrease:
-#             # take the (clipped) fraction-to-boundary step even if residual didn't shrink enough
-#             z = z_trial.detach()
-
-#     # Unpack and assemble outputs
-#     q_next, v_next, lamN, beta, r, y, s, w = unpack(z)
-#     lam_t = beta[0] - beta[1]
-#     lam_vec = torch.stack([lamN, lam_t])
-#     phi = y  # y equals the gap at solution (softened)
-
-#     return q_next, v_next, pusher_pos_next, lam_vec, phi
 
 def implicit_euler_defects(qk, vk, prk, uk,
                            qk1, vk1, prk1,
@@ -784,6 +967,7 @@ def implicit_euler_defects(qk, vk, prk, uk,
     return r, lam, phi
 
 def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy, 
+            w_target = 20.0, w_orient = 1.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
             qp_solver = None, dynamics_solver=None, obstacle_pos=None, device=None):
     """
     Rollout a trajectory given control sequence.
@@ -829,7 +1013,7 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     qs = [q0]
     qrobot_hist = [pr0]
     obs_term = 0.0
-    
+    z_prev = None
     # Simulate forward
     for k in range(horizon):
         if dynamics_solver == 'LCP':
@@ -838,14 +1022,16 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
                 qp_solver=qp_solver, alpha_stab=0.1, device=device
             )
         elif dynamics_solver == 'IP':
-            q, v, pr, lamk, phik = step_square_pos_ip(
+            q, v, pr, lamk, phik, z_prev = step_square_pos_ip(
                 q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
-                skip_solving_threshold = 0.3,
-                ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-5, smooth_sdf=50.0, #smooth_sdf is unused
+                skip_solving_threshold = 0.003,
+                ipm_opts=IPMOptions(target_mu=1e-6, max_newton=20, tol=1e-3, smooth_sdf=50.0, #smooth_sdf is unused
                     enable_viscous_ground_friction=True,
-                    c_lin=8.0,          
-                    c_ang=8.0 * half     
-                    ))
+                    c_lin=1.0,
+                    c_ang=0.00667 ### c_ang = c_lin * (Izz/m)
+                    ),
+                z_prev=z_prev
+                )
 
         lambdas.append(lamk)
         phis.append(phik)
@@ -854,18 +1040,24 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
         
         # Obstacle avoidance term
         if obstacle_pos is not None:
-            obs_term += 1.0 / (torch.sum((pr - obstacle_pos) ** 2) + 0.01)
+            obs_term += w_obs / (torch.sum((pr - obstacle_pos) ** 2) + 0.01)
     
     obs_term /= horizon
     
     # Cost function
-    goal_term = 20.0 * torch.sum((q - goal_xy) ** 2)      # Goal reaching
-    ctrl_term = 1e-3 * torch.sum(u_seq ** 2)               # Control effort
-    v_term = 0.1 * torch.sum(v ** 2)                       # Terminal velocity
+    pos_error = q[:2] - goal_xy[:2]
+    theta_error = q[2] - goal_xy[2]
+    theta_error = torch.atan2(torch.sin(theta_error), torch.cos(theta_error))  # wrap to [-pi, pi]
+
+    goal_term = w_target * (torch.sum(pos_error **2))      # Goal reaching
+    orient_term = w_orient * (theta_error ** 2)            # Orientation error
+    
+    ctrl_term = w_ctrl * torch.sum((u_seq)**2)
+
+    v_term = w_v * torch.sum(v ** 2)                       # Terminal velocity
     pen_term = 0.0  # Penetration penalty (disabled)
     
-    loss = goal_term + ctrl_term + pen_term + v_term + obs_term
+    loss = goal_term + orient_term + ctrl_term + pen_term + v_term + obs_term
     
     return loss, q, torch.stack(lambdas), torch.stack(phis), torch.stack(qs), torch.stack(qrobot_hist),\
-        goal_term, ctrl_term, v_term, obs_term, pen_term
-
+        goal_term, orient_term, ctrl_term, v_term, obs_term, pen_term

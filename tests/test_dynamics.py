@@ -24,7 +24,7 @@ Izz = 1.0 / 6.0
 half = 0.1
 mu = 0.6
 h = 0.02
-horizon = 100 #100 #150
+horizon = 100 #100 #100 #150
 
 # Initial state
 # q0 = torch.tensor([0.0, 0.0, 0.0], dtype=dtype, device=device)
@@ -51,32 +51,35 @@ os.makedirs("results", exist_ok=True)
 # ===========================================================
 # 2. Run simulation with CVXPY solver
 # ===========================================================
-print("\n=== Running simulation with CVXPY solver ===")
-solver_cvx = ContactQPSolver(mu=mu, n_contacts=1, backend="cvxpy")
+# print("\n=== Running simulation with CVXPY solver ===")
+# solver_cvx = ContactQPSolver(mu=mu, n_contacts=1, backend="cvxpy")
 
-loss_cvx, q_final_cvx, lam_hist_cvx, phi_hist_cvx, q_hist_cvx, pusher_hist_cvx,_,_,_,_,_ = rollout(
-    u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal, qp_solver=solver_cvx, dynamics_solver='LCP',
-    device=device
-)
+# start_time = time.time()
 
-result_cvx = {
-    "trajectory": q_hist_cvx.cpu().numpy(),
-    "pusher_trajectory": pusher_hist_cvx.cpu().numpy(),
-    "contact_forces": lam_hist_cvx.cpu().numpy(),
-    "signed_distances": phi_hist_cvx.cpu().numpy(),
-    "u_seq": u_seq.cpu().numpy(),
-}
+# loss_cvx, q_final_cvx, lam_hist_cvx, phi_hist_cvx, q_hist_cvx, pusher_hist_cvx,_,_,_,_,_ = rollout(
+#     u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal, qp_solver=solver_cvx, dynamics_solver='LCP',
+#     device=device
+# )
+# print(f'Time elapsed for CVXPY forward calculation: {time.time() - start_time}')
 
-visualize_result(
-    result_cvx,
-    goal.cpu().numpy(),
-    half_size=half,
-    save_trajectory="results/traj_cvx.png",
-    save_animation="results/traj_cvx.mp4",
-    save_analysis="results/analysis_cvx.png",
-    xlim=(-0.3, 0.6),
-    ylim=(-0.3, 0.6),
-)
+# result_cvx = {
+#     "trajectory": q_hist_cvx.cpu().numpy(),
+#     "pusher_trajectory": pusher_hist_cvx.cpu().numpy(),
+#     "contact_forces": lam_hist_cvx.cpu().numpy(),
+#     "signed_distances": phi_hist_cvx.cpu().numpy(),
+#     "u_seq": u_seq.cpu().numpy(),
+# }
+
+# visualize_result(
+#     result_cvx,
+#     goal.cpu().numpy(),
+#     half_size=half,
+#     save_trajectory="results/traj_cvx.png",
+#     save_animation="results/traj_cvx.mp4",
+#     save_analysis="results/analysis_cvx.png",
+#     xlim=(-0.3, 0.6),
+#     ylim=(-0.3, 0.6),
+# )
 
 # ===========================================================
 # 3. Run simulation with interior point solver
@@ -97,10 +100,10 @@ for k in range(horizon):
     # ========================= Small demo usage (pseudo) ========================= #
     # damping is implemented differently (apply damping force instead of damping on vel)
     # Also thye lam here is actual force, not impulse
-    q_next, v_next, pr_next, lam, phi = step_square_pos_ip(
+    q_next, v_next, pr_next, lam, phi = step_square_pos_ip2(
        q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
        skip_solving_threshold = 0.3,
-        ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-4, smooth_sdf=5.0,
+        ipm_opts=IPMOptions(target_mu=1e-4, max_newton=20, tol=1e-3, smooth_sdf=5.0,
         enable_viscous_ground_friction=True,
         c_lin=80.0,          
         c_ang=80.0 * half     
@@ -120,8 +123,28 @@ for k in range(horizon):
     lams_ip.append(lam)
     phis_ip.append(phi)
     q, v, pr = q_next, v_next, pr_next
+print('%%%%%%')
+print(f'Time elapsed for IP forward calculation: {time.time() - start_time}')
 
-print(f'Time elapsed: {time.time() - start_time}')
+
+## Test Gradient calculation time
+# start_time = time.time()
+# u_seq.requires_grad = True
+# q0.requires_grad = True
+# v0.requires_grad = True
+# pr0.requires_grad = True
+# loss, q_final, lambdas, phis, qs, pusher_traj, goal_term, ctrl_term, v_term, obs_term, pen_term = rollout(
+#     u_seq, q0, v0, pr0, horizon, h,
+#     m, Izz, half, mu, goal,
+#     w_target = 20.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
+#     qp_solver = None,
+#     dynamics_solver='IP', obstacle_pos=None,
+#     device=device
+# )
+# loss.backward()
+# print(f'Time elapsed for IP forward + backward calculation: {time.time() - start_time}')
+
+
 
 result_ip = {
     "trajectory": torch.stack(qs_ip).detach().cpu().numpy(),
