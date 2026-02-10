@@ -68,18 +68,6 @@ class ALMConfig:
     lbfgsMaxIter: int = 20
     lbfgsHistorySize: int = 20
 
-    # Terminal ALM for XY
-    rhoTerminalInitXY: float = 10.0
-    rhoTerminalMaxXY: float = 1e6
-    rhoTerminalEtaXY: float = 10.0
-    tolTerminalXY: float = 5e-3      # 5 mm (user request)
-    
-    # Terminal ALM for theta
-    rhoTerminalInitTheta: float = 10.0
-    rhoTerminalMaxTheta: float = 1e6
-    rhoTerminalEtaTheta: float = 10.0
-    tolTerminalTheta: float = 1e-3   # rad (example)
-
     # Defect ALM
     rhoDefectInit: float = 1.0
     rhoDefectMax: float = 1e6
@@ -88,6 +76,8 @@ class ALMConfig:
 
     # Learning rate for Adam (if not LBFGS)
     lr: float = 5e-2
+    lrDecayStep: int = 20
+    lrDecayGamma: float = 0.5
 
 
 @dataclass
@@ -96,6 +86,8 @@ class CostWeights:
     wControl: float = 1.0
     wControlSmooth: float = 1.0
     wObjVel: float = 0.0  # set >0 if you want object velocity regularization
+    wTargetXY: float = 1.0  
+    wTargetOrient: float = 1.0
 
 
 class BlockMultipleShootingWithALM:
@@ -108,9 +100,6 @@ class BlockMultipleShootingWithALM:
         dt: float = 0.05,
         blockSize: int = 5,
         device: str = "cuda",
-        # Toggle constraints (for your incremental plan)
-        enableTerminalXYALM: bool = True,
-        enableTerminalThetaALM: bool = False,
         enableDefectALM: bool = True,
         # Physics / solver tuning
         ipmWarmStart: bool = True,
@@ -137,30 +126,18 @@ class BlockMultipleShootingWithALM:
         self.numBlocks = math.ceil(self.horizon / self.blockSize)
         self.numKnots = self.numBlocks + 1  # includes knot 0
 
-        self.enableTerminalXYALM = bool(enableTerminalXYALM)
-        self.enableTerminalThetaALM = bool(enableTerminalThetaALM)
         self.enableDefectALM = bool(enableDefectALM)
         self.ipmWarmStart = bool(ipmWarmStart)
 
         self.ipmOpts = ipmOpts if ipmOpts is not None else IPMOptions()
         self.skipSolvingThreshold = float(skipSolvingThreshold)
 
-        # Dual variables (initialized in resetAlmState)
-        self.lamTerminalXY: Optional[torch.Tensor] = None  # [2]
-        self.lamTerminalTheta: Optional[torch.Tensor] = None  # [1]
-        self.lamDefect: Optional[torch.Tensor] = None  # [numBlocks, 5] (3 obj + 2 robot)
-
         self.rhoTerminalXY: float = 0.0
         self.rhoTerminalTheta: float = 0.0
         self.rhoDefect: float = 0.0
 
     def resetAlmState(self, cfg: ALMConfig) -> None:
-        self.rhoTerminalXY = cfg.rhoTerminalInitXY
-        self.rhoTerminalTheta = cfg.rhoTerminalInitTheta
         self.rhoDefect = cfg.rhoDefectInit
-
-        self.lamTerminalXY = torch.zeros(2, device=self.device)
-        self.lamTerminalTheta = torch.zeros(1, device=self.device)
         self.lamDefect = torch.zeros(self.numBlocks, 5, device=self.device)  # (dx,dy,dth,dpx,dpy)
 
     def _simulateBlock(
@@ -232,7 +209,7 @@ class BlockMultipleShootingWithALM:
             
             # 3. Stationarity criteria
             grad_threshold = 1e-2  # Gradient should be small
-            feas_threshold = cfg.tolDefect + cfg.tolTerminalXY
+            feas_threshold = cfg.tolDefect
             
             grad_ok = total_grad < grad_threshold
             feas_ok = total_viol < feas_threshold
@@ -321,17 +298,9 @@ class BlockMultipleShootingWithALM:
         # ALM state init
         self.resetAlmState(cfg)
 
-        # Optimizer setup
-        if cfg.useLbfgs:
-            optimizer = torch.optim.LBFGS(
-                [uSeq, qKnots, prKnots],
-                max_iter=cfg.lbfgsMaxIter,
-                history_size=cfg.lbfgsHistorySize,
-                line_search_fn="strong_wolfe",
-            )
-        else:
-            # optimizer = torch.optim.Adam([uSeq, qKnots, prKnots], lr=cfg.lr)
-            optimizer = torch.optim.Adam([uSeq, qKnots, prKnots], lr=cfg.lr)
+        
+
+        # sched = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg.lrDecayStep, gamma=cfg.lrDecayGamma)
 
         # Logs
         history = {
@@ -346,6 +315,20 @@ class BlockMultipleShootingWithALM:
 
         for outer in range(cfg.outerIters):
             _enforceInitialKnot()
+            # reset scheduler each outer iter
+            # Optimizer setup
+            if cfg.useLbfgs:
+                optimizer = torch.optim.LBFGS(
+                    [uSeq, qKnots, prKnots],
+                    max_iter=cfg.lbfgsMaxIter,
+                    history_size=cfg.lbfgsHistorySize,
+                    line_search_fn="strong_wolfe",
+                )
+            else:
+                # optimizer = torch.optim.Adam([uSeq, qKnots, prKnots], lr=cfg.lr)
+                optimizer = torch.optim.Adam([uSeq, qKnots, prKnots], lr=cfg.lr)
+        
+            sched = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg.lrDecayStep, gamma=cfg.lrDecayGamma)
 
             def closure():
                 optimizer.zero_grad(set_to_none=True)
@@ -377,9 +360,9 @@ class BlockMultipleShootingWithALM:
                     # For later blocks, we set vStart=0 as a pragmatic approximation; for higher fidelity,
                     # lift v at knots too (optional).
                     if j == 0:
-                        vStart = v0
+                        vStart = v0.detach().requires_grad_(True)
                     else:
-                        vStart = torch.zeros_like(v0)
+                        vStart = torch.zeros(3, device=self.device, dtype=v0.dtype, requires_grad=True)
 
                     qEndPred, vEndPred, prEndPred, objVelEnergyBlock, lamdaBlock, phisBlock, qsBlock, qrobot_histBlock = self._simulateBlock(
                         qStart, vStart, prStart, uSeq[t0:t1], steps
@@ -412,29 +395,23 @@ class BlockMultipleShootingWithALM:
                 # Terminal ALM
                 rXY = qKnots[-1][:2] - goalXY
                 terminalXYNormSq = (rXY ** 2).sum()
-                almTerminal = torch.zeros((), device=self.device)
+                targetCost = w.wTargetXY * terminalXYNormSq
 
-                if self.enableTerminalXYALM:
-                    lamXY = self.lamTerminalXY
-                    almTerminal = almTerminal + (lamXY * rXY).sum() + 0.5 * self.rhoTerminalXY * terminalXYNormSq
-
-                terminalThetaAbs = torch.zeros((), device=self.device)
-                if self.enableTerminalThetaALM:
-                    if goalTheta is None:
-                        raise ValueError("goalTheta must be provided when enableTerminalThetaALM=True")
+                targetOrientCost = torch.zeros((), device=self.device)
+                if goalTheta is not None:
                     rTh = wrap_to_pi(qKnots[-1][2] - torch.as_tensor(goalTheta, device=self.device))
-                    terminalThetaAbs = rTh.abs()
-                    lamTh = self.lamTerminalTheta
-                    almTerminal = almTerminal + (lamTh[0] * rTh) + 0.5 * self.rhoTerminalTheta * (rTh ** 2)
+                    targetOrientCost = w.wTargetOrient * (rTh ** 2)
 
                 # Total objective
                 soft = (
                     w.wControl * controlEnergy
                     + w.wControlSmooth * controlSmooth
                     + w.wObjVel * objVelEnergy
+                    + targetCost
+                    + targetOrientCost
                 )
 
-                total = soft + almDefect + almTerminal
+                total = soft + almDefect
 
                 total.backward()
                 grad_norm = uSeq.grad.norm().item()
@@ -446,7 +423,6 @@ class BlockMultipleShootingWithALM:
                     "total": total,
                     "soft": soft,
                     "almDefect": almDefect,
-                    "almTerminal": almTerminal,
                     "controlEnergy": controlEnergy,
                     "controlSmooth": controlSmooth,
                     "objVelEnergy": objVelEnergy,
@@ -466,6 +442,7 @@ class BlockMultipleShootingWithALM:
                 for _ in range(cfg.innerIters):
                     result = closure()
                     optimizer.step()
+                    sched.step()
 
             lossVal = result["total"] if isinstance(result, dict) else None
             qs = result["qs"] if isinstance(result, dict) else None
@@ -513,19 +490,10 @@ class BlockMultipleShootingWithALM:
                     if defectNorm.item() > cfg.tolDefect:
                         self.rhoDefect = min(self.rhoDefect * cfg.rhoDefectEta, cfg.rhoDefectMax)
 
-                # Dual update for terminal
-                if self.enableTerminalXYALM:
-                    self.lamTerminalXY = self.lamTerminalXY + self.rhoTerminalXY * rXY
-                    if terminalXYNorm.item() > cfg.tolTerminalXY:
-                        self.rhoTerminalXY = min(self.rhoTerminalXY * cfg.rhoTerminalEtaXY, cfg.rhoTerminalMaxXY)
 
                 terminalThetaAbs = torch.zeros((), device=self.device)
-                if self.enableTerminalThetaALM:
-                    rTh = wrap_to_pi(qKnots[-1][2] - torch.as_tensor(goalTheta, device=self.device))
-                    terminalThetaAbs = rTh.abs()
-                    self.lamTerminalTheta[0] = self.lamTerminalTheta[0] + self.rhoTerminalTheta * rTh
-                    if terminalThetaAbs.item() > cfg.tolTerminalTheta:
-                        self.rhoTerminalTheta = min(self.rhoTerminalTheta * cfg.rhoTerminalEtaTheta, cfg.rhoTerminalMaxTheta)
+                rTh = wrap_to_pi(qKnots[-1][2] - torch.as_tensor(goalTheta, device=self.device))
+                terminalThetaAbs = rTh.abs()
 
                 is_stationary, stat_info = self.check_stationarity(
                                             outer, uSeq, qKnots, prKnots, 
