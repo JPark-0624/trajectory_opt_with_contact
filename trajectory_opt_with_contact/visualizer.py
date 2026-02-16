@@ -226,12 +226,34 @@ class TrajectoryVisualizer:
         """
         fig, axes = plt.subplots(2, 3, figsize=(15, 8))
         
+
+        dt = 0.05
+        
+
         traj = result['trajectory']
         forces = result['contact_forces']
         phis = result['signed_distances']
         u_seq = result['u_seq']
         
-        dt = 0.05
+        # Prefer state velocity if provided; otherwise finite-diff
+        if 'velocity_trajectory' in result and result['velocity_trajectory'] is not None:
+            vel = result['velocity_trajectory']
+            vel = np.asarray(vel)
+
+            # Accept [T+1, 3] or [T+1, 2] etc. Use xy components if available.
+            if vel.ndim == 2 and vel.shape[1] >= 2:
+                vel_xy = vel[:, :2]
+            else:
+                raise ValueError(f"velocity_trajectory has unexpected shape: {vel.shape}")
+
+            vel_mag = np.linalg.norm(vel_xy, axis=1)
+            tVel = np.arange(len(vel_mag)) * dt
+        else:
+            vel = np.diff(traj[:, :2], axis=0) / dt  # length T
+            vel_mag = np.linalg.norm(vel, axis=1)
+            tVel = np.arange(len(vel_mag)) * dt
+
+
         time = np.arange(len(forces)) * dt
         
         # 1. Position error magnitude
@@ -287,9 +309,8 @@ class TrajectoryVisualizer:
         ax = axes[1, 2]
         # Kinetic energy proxy (velocity magnitude over time)
         # Compute velocity from position differences
-        vel = np.diff(traj[:, :2], axis=0) / dt
         vel_mag = np.linalg.norm(vel, axis=1)
-        ax.plot(time, vel_mag, 'orange', linewidth=2)
+        ax.plot(tVel, vel_mag, 'orange', linewidth=2)
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Velocity Magnitude (m/s)')
         ax.set_title('Object Velocity')
