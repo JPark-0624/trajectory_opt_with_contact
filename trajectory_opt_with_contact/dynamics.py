@@ -972,6 +972,8 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     """
     Rollout a trajectory given control sequence.
     
+    CRITICAL: All scalar operations must use PyTorch tensors to preserve gradients!
+    
     Args:
         u_seq: Control sequence (T, 2) pusher velocities
         q0: Initial configuration (3,)
@@ -1002,9 +1004,6 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     if qp_solver is None and dynamics_solver == 'LCP':
         qp_solver = ContactQPSolver(mu=mu, n_contacts=1)
     
-    # if obstacle_pos is None:
-    #     obstacle_pos = torch.tensor([0.2, -0.2], device=device)
-    
     q = q0
     v = v0
     pr = pr0
@@ -1012,8 +1011,11 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     phis = []
     qs = [q0]
     qrobot_hist = [pr0]
-    obs_term = 0.0
+    
+    # CRITICAL: Initialize as PyTorch tensor, not Python scalar!
+    obs_term = torch.tensor(0.0, dtype=q0.dtype, device=device)
     z_prev = None
+    
     # Simulate forward
     for k in range(horizon):
         if dynamics_solver == 'LCP':
@@ -1025,10 +1027,10 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
             q, v, pr, lamk, phik, z_prev = step_square_pos_ip(
                 q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
                 skip_solving_threshold = 0.003,
-                ipm_opts=IPMOptions(target_mu=1e-6, max_newton=20, tol=1e-3, smooth_sdf=50.0, #smooth_sdf is unused
+                ipm_opts=IPMOptions(target_mu=1e-6, max_newton=20, tol=1e-3, smooth_sdf=50.0,
                     enable_viscous_ground_friction=True,
                     c_lin=1.0,
-                    c_ang=0.00667 ### c_ang = c_lin * (Izz/m)
+                    c_ang=0.00667  # c_ang = c_lin * (Izz/m)
                     ),
                 z_prev=z_prev
                 )
@@ -1039,23 +1041,26 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
         qrobot_hist.append(pr)
         
         # Obstacle avoidance term
+        # CRITICAL: 0.01 must be a tensor!
         if obstacle_pos is not None:
-            obs_term += w_obs / (torch.sum((pr - obstacle_pos) ** 2) + 0.01)
+            epsilon = torch.tensor(0.01, dtype=q0.dtype, device=device)
+            obs_term = obs_term + w_obs / (torch.sum((pr - obstacle_pos) ** 2) + epsilon)
     
-    obs_term /= horizon
+    # Division by Python int is OK (PyTorch handles it)
+    obs_term = obs_term / horizon
     
     # Cost function
     pos_error = q[:2] - goal_xy[:2]
     theta_error = q[2] - goal_xy[2]
     theta_error = torch.atan2(torch.sin(theta_error), torch.cos(theta_error))  # wrap to [-pi, pi]
 
-    goal_term = w_target * (torch.sum(pos_error **2))      # Goal reaching
-    orient_term = w_orient * (theta_error ** 2)            # Orientation error
+    goal_term = w_target * (torch.sum(pos_error ** 2))      # Goal reaching
+    orient_term = w_orient * (theta_error ** 2)             # Orientation error
+    ctrl_term = w_ctrl * torch.sum(u_seq ** 2)              # Control effort
+    v_term = w_v * torch.sum(v ** 2)                        # Terminal velocity
     
-    ctrl_term = w_ctrl * torch.sum((u_seq)**2)
-
-    v_term = w_v * torch.sum(v ** 2)                       # Terminal velocity
-    pen_term = 0.0  # Penetration penalty (disabled)
+    # CRITICAL: pen_term must be a tensor!
+    pen_term = torch.tensor(0.0, dtype=q0.dtype, device=device)  # Penetration penalty (disabled)
     
     loss = goal_term + orient_term + ctrl_term + pen_term + v_term + obs_term
     

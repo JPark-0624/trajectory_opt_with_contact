@@ -233,7 +233,8 @@ class TrajectoryOptimizer:
 
                     loss.backward()
                     grad_norm = u_seq.grad.norm().item()
-                    print(f"||grad_u||={grad_norm:.4e}")
+                    if verbose and (it+1) % 10 == 0:
+                        print(f"||grad_u||={grad_norm:.4e}")
 
                     if not use_fixed_schedule:
                         # --- Adaptive LR based on grad norm ---
@@ -261,7 +262,7 @@ class TrajectoryOptimizer:
                         no_improve = 0
                     else:
                         no_improve += 1
-                    if verbose and (it+1) % 1 == 0:
+                    if verbose and (it+1) % 10 == 0:
                         print(f"[Shooting] Iter {it+1:3d} | "
                             f"Total={to_scalar(loss):.4f} | "
                             f"Goal={to_scalar(goal_term):.4f} | "
@@ -272,7 +273,7 @@ class TrajectoryOptimizer:
                             f"Pen={to_scalar(pen_term):.4f} | "
                             f"LR={lr_current:.3e} | "
                             f"||∇_u J||={grad_norm:.3e} | "
-                            f"||Δu||={du:.3e}"
+                            #f"||Δu||={du:.3e}"
                             )
                         print(f"Target Pos: {[f'{x:.3f}' for x in goal.tolist()]}, "
                                 f"Final pos: {[f'{x:.3f}' for x in q_final.tolist()]}")

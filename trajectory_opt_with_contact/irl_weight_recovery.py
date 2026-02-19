@@ -24,6 +24,76 @@ from .dynamics import rollout
 from .optimizer import TrajectoryOptimizer
 
 
+class ImplicitGradient(torch.autograd.Function):
+    """
+    Implicit differentiation using vector-Jacobian products.
+    
+    Given u*(w) from optimization where ∇_u L(u*; w) = 0,
+    compute ∂u*/∂w efficiently.
+    """
+    
+    @staticmethod
+    def forward(ctx, u_star, w, q0, v0, pusher0, goal, obstacle_pos, irl_instance):
+        ctx.save_for_backward(u_star, w, q0, v0, pusher0, goal, 
+                            obstacle_pos if obstacle_pos is not None else torch.zeros(1, device=u_star.device))
+        ctx.irl = irl_instance
+        ctx.has_obstacle = obstacle_pos is not None
+        return u_star.detach()
+    
+    @staticmethod  
+    def backward(ctx, grad_output):
+        """
+        Efficient backward using vjp.
+        """
+        u_star, w, q0, v0, pusher0, goal, obs_or_dummy = ctx.saved_tensors
+        obstacle_pos = obs_or_dummy if ctx.has_obstacle else None
+        irl = ctx.irl
+        
+        # Create fresh leaf tensors with requires_grad=True
+        u_fresh = u_star.detach().clone().requires_grad_(True)
+        w_fresh = w.detach().clone().requires_grad_(True)
+        
+        # Debug: print all input tensors
+        print(f"[DEBUG] Calling _weighted_rollout:")
+        print(f"  u_fresh: shape={u_fresh.shape}, requires_grad={u_fresh.requires_grad}, is_leaf={u_fresh.is_leaf}")
+        print(f"  w_fresh: shape={w_fresh.shape}, requires_grad={w_fresh.requires_grad}, is_leaf={w_fresh.is_leaf}")
+        print(f"  q0: requires_grad={q0.requires_grad}")
+        print(f"  v0: requires_grad={v0.requires_grad}")
+        print(f"  pusher0: requires_grad={pusher0.requires_grad}")
+        print(f"  goal: requires_grad={goal.requires_grad}")
+        
+        # Compute loss with fresh tensors
+        loss = irl._weighted_rollout(u_fresh, q0, v0, pusher0, goal, w_fresh, obstacle_pos)
+        
+        print(f"[DEBUG] After _weighted_rollout:")
+        print(f"  loss: {loss}")
+        print(f"  loss.requires_grad: {loss.requires_grad}")
+        print(f"  loss.grad_fn: {loss.grad_fn}")
+        print(f"  loss.dtype: {loss.dtype}")
+        print(f"  type(loss): {type(loss)}")
+        
+        # Sanity check
+        if not loss.requires_grad:
+            raise RuntimeError(
+                "Loss from _weighted_rollout does not require grad!"
+            )
+        
+        # Compute ∇_u L
+        grad_u = torch.autograd.grad(loss, u_fresh, create_graph=True)[0]
+        
+        # Solve H^T · v = -grad_output for v (approximate: v ≈ -grad_output)
+        v = -grad_output
+        
+        # Compute v^T · B = v^T · (∂grad_u/∂w)
+        grad_w = torch.autograd.grad(
+            grad_u, w_fresh, 
+            grad_outputs=v,
+            retain_graph=False
+        )[0]
+        
+        return None, grad_w, None, None, None, None, None, None
+
+
 @dataclass
 class IRLOptions:
     """Options for IRL weight recovery."""
@@ -33,8 +103,15 @@ class IRLOptions:
     lr_weights: float = 0.01           # Learning rate for weight optimization
     lr_trajectory: float = 0.01        # Learning rate for inner trajectory optimization
     
+    # Learning rate scheduling
+    use_lr_scheduler: bool = True      # Use ReduceLROnPlateau
+    lr_scheduler_patience: int = 5     # Patience for plateau detection
+    lr_scheduler_factor: float = 0.5   # LR reduction factor
+    lr_scheduler_min_lr: float = 1e-5  # Minimum learning rate (lower bound!)
+    
     # Method selection
     method: str = "feature_matching"   # "feature_matching" or "control_matching"
+    use_implicit_diff: bool = False    # Use implicit differentiation (recommended for control_matching!)
     
     # Convergence criteria
     weight_tol: float = 1e-4           # Tolerance for weight change
@@ -193,7 +270,11 @@ class IRLWeightRecovery:
         
         loss_history = []
         control_error_history = []
-        u_current = None
+        u_current = self._to_tensor(self.optimizer.compute_geometric_initial_trajectory(
+            robot_pos=pusher0.detach().cpu().numpy(),
+            box_pos=q0.detach().cpu().numpy(),
+            goal_pos=goal.detach().cpu().numpy()
+        ))
         w_prev = None
         
         for iter in range(opts.max_outer_iters):
@@ -292,14 +373,35 @@ class IRLWeightRecovery:
         if w_init is None:
             w_raw = torch.zeros(self.n_features, dtype=torch.double,
                                device=self.device, requires_grad=True)
+            w_raw = torch.tensor([0.25, 0.25, 0.25, 0.24, 0.01], dtype=torch.double, device=self.device, requires_grad=True)
+
         else:
             w_raw = torch.logit(w_init.clone()).requires_grad_(True)
         
         optimizer_w = torch.optim.Adam([w_raw], lr=opts.lr_weights)
         
+        # Optional: LR scheduler
+        scheduler_w = None
+        if opts.use_lr_scheduler:
+            scheduler_w = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer_w,
+                mode='min',
+                factor=opts.lr_scheduler_factor,
+                patience=opts.lr_scheduler_patience,
+                min_lr=opts.lr_scheduler_min_lr
+                # Note: 'verbose' parameter not available in all PyTorch versions
+            )
+            if opts.verbose:
+                print(f"   LR Scheduler enabled: patience={opts.lr_scheduler_patience}, factor={opts.lr_scheduler_factor}")
+        
         loss_history = []
         control_error_history = []
-        u_current = None
+        lr_history = []
+        u_current = self._to_tensor(self.optimizer.compute_geometric_initial_trajectory(
+            robot_pos=pusher0.detach().cpu().numpy(),
+            box_pos=q0.detach().cpu().numpy(),
+            goal_pos=goal.detach().cpu().numpy()
+        ))
         
         for iter in range(opts.max_outer_iters):
             optimizer_w.zero_grad()
@@ -307,14 +409,17 @@ class IRLWeightRecovery:
             # Project to simplex
             w = F.softmax(w_raw, dim=0)
             
-            # Solve inner trajectory optimization WITH unrolled differentiation
+            # Solve inner trajectory optimization
+            use_implicit = opts.use_implicit_diff if hasattr(opts, 'use_implicit_diff') else False
+            
             u_current = self._solve_trajectory_with_weights(
                 w, q0, v0, pusher0, goal, obstacle_pos,
                 u_init=u_current if opts.warm_start_inner else None,
                 max_iters=opts.max_inner_iters,
                 lr=opts.lr_trajectory,
                 verbose=False,
-                keep_graph=True  # ← Enable unrolled differentiation!
+                keep_graph=(not use_implicit),  # Unrolled if not implicit
+                use_implicit=use_implicit        # Implicit differentiation!
             )
             
             # Direct control matching loss
@@ -330,10 +435,15 @@ class IRLWeightRecovery:
             loss_history.append(loss.item())
             control_error_history.append(control_error)
             
+            # Track learning rate
+            current_lr = optimizer_w.param_groups[0]['lr']
+            lr_history.append(current_lr)
+            
             if opts.verbose and (iter % 10 == 0 or iter < 5):
                 print(f"\nIter {iter:3d}:")
                 print(f"  Control loss: {loss.item():.6f}")
                 print(f"  Control error: {control_error:.6f}")
+                print(f"  Learning rate: {current_lr:.6e}")
                 self._print_weights(w)
             
             # Check convergence
@@ -349,11 +459,16 @@ class IRLWeightRecovery:
             # Backward pass (through entire optimization!)
             loss.backward()
             optimizer_w.step()
+            
+            # Update LR scheduler
+            if scheduler_w is not None:
+                scheduler_w.step(loss.item())
         
         return {
             'w_recovered': F.softmax(w_raw, dim=0).detach(),
             'loss_history': loss_history,
             'control_error_history': control_error_history,
+            'lr_history': lr_history,
             'converged': control_error < opts.control_tol,
             'num_iters': iter + 1,
             'u_final': u_current.detach()
@@ -371,7 +486,8 @@ class IRLWeightRecovery:
         max_iters: int = 100,
         lr: float = 0.01,
         verbose: bool = False,
-        keep_graph: bool = False  # NEW: control whether to keep gradient
+        keep_graph: bool = False,
+        use_implicit: bool = False  # NEW!
     ) -> torch.Tensor:
         """
         Solve trajectory optimization with given weight vector.
@@ -380,13 +496,17 @@ class IRLWeightRecovery:
         
         Args:
             w: Weight vector [w_target, w_orient, w_v, w_ctrl, w_obs]
-            keep_graph: If True, use unrolled differentiation (for control matching)
-                       If False, use standard optimization (for feature matching)
+            keep_graph: If True, use unrolled differentiation
+            use_implicit: If True, use implicit differentiation (recommended!)
         
         Returns:
             u_opt: Optimal control sequence (T, 2)
         """
-        if keep_graph:
+        if use_implicit:
+            return self._solve_trajectory_implicit(
+                w, q0, v0, pusher0, goal, obstacle_pos, u_init, max_iters, lr, verbose
+            )
+        elif keep_graph:
             # UNROLLED DIFFERENTIATION (for control matching)
             return self._solve_trajectory_unrolled(
                 w, q0, v0, pusher0, goal, obstacle_pos, u_init, max_iters, lr, verbose
@@ -411,23 +531,33 @@ class IRLWeightRecovery:
         verbose: bool
     ) -> torch.Tensor:
         """
-        Standard trajectory optimization (no gradient tracking).
-        Used for feature matching.
+        Standard trajectory optimization using PyTorch directly.
+        
+        This is needed for implicit differentiation - we can't use
+        optimizer.optimize() because it converts weights to float.
         """
         # Initialize controls
         if u_init is None:
-            u_seq = torch.zeros(self.optimizer.horizon, 2, 
-                               dtype=torch.double, device=self.device, 
-                               requires_grad=True)
+            u_init_np = self.optimizer.compute_geometric_initial_trajectory(
+                robot_pos=pusher0.detach().cpu().numpy(),
+                box_pos=q0.detach().cpu().numpy(),
+                goal_pos=goal.detach().cpu().numpy()
+            )
+            u_seq = torch.tensor(u_init_np, dtype=torch.double, device=self.device)
         else:
-            u_seq = u_init.clone().detach().requires_grad_(True)
+            u_seq = u_init.clone()
         
+        # Make it a parameter
+        u_seq = u_seq.detach().requires_grad_(True)
+        
+        # Optimize using Adam
         opt = torch.optim.Adam([u_seq], lr=lr)
         
         for iter in range(max_iters):
             opt.zero_grad()
             
-            # Compute weighted cost
+            # Compute loss using _weighted_rollout
+            # IMPORTANT: Use w.detach() so u_seq doesn't depend on w
             loss = self._weighted_rollout(
                 u_seq, q0, v0, pusher0, goal, w.detach(), obstacle_pos
             )
@@ -454,46 +584,85 @@ class IRLWeightRecovery:
         verbose: bool
     ) -> torch.Tensor:
         """
-        Unrolled differentiation using functional gradient descent.
+        Unrolled differentiation: manually implement optimizer.optimize()
+        but keep computational graph.
         
-        Key: grad_u = ∇_u L(u; w) must maintain gradient w.r.t. w!
-        This is achieved with create_graph=True.
+        Structure:
+        TOP:    minimize_w ||u*(w) - u_demo||²
+        MIDDLE: u*(w) = argmin_u L(u; w)  ← THIS FUNCTION
+        LOW:    rollout() with dynamics
         """
-        # Initialize
+        # Initialize controls
         if u_init is None:
-            u = torch.zeros(self.optimizer.horizon, 2, 
-                           dtype=torch.double, device=self.device)
+            u_init_np = self.optimizer.compute_geometric_initial_trajectory(
+                robot_pos=pusher0.detach().cpu().numpy(),
+                box_pos=q0.detach().cpu().numpy(),
+                goal_pos=goal.detach().cpu().numpy()
+            )
+            u_seq = torch.tensor(u_init_np, dtype=torch.double, device=self.device)
         else:
-            u = u_init.clone().detach()
+            u_seq = u_init.clone().detach()
         
-        # Functional gradient descent
+        # Convert to parameter
+        u_param = torch.nn.Parameter(u_seq)
+        
+        # Use Adam optimizer (same as optimizer.optimize()!)
+        opt = torch.optim.Adam([u_param], lr=lr)
+        
+        # Replicate what optimizer.optimize() does, but with gradient tracking
         for iter in range(max_iters):
-            # Make u require gradient for THIS iteration
-            u = u.detach().requires_grad_(True)
+            opt.zero_grad()
             
-            # Compute loss (depends on both u and w)
+            # Compute weighted cost - this depends on w!
             loss = self._weighted_rollout(
-                u, q0, v0, pusher0, goal, w, obstacle_pos
+                u_param, q0, v0, pusher0, goal, w, obstacle_pos
             )
             
-            # CRITICAL: create_graph=True to maintain w gradient!
-            # grad_u = ∂L/∂u, but this also depends on w
-            grad_u = torch.autograd.grad(
-                outputs=loss,
-                inputs=u,
-                create_graph=True  # ← This is the key!
-            )[0]
+            # Backward with create_graph to maintain w gradient
+            loss.backward(create_graph=True)
             
-            # Functional update: u_new = u - lr * grad_u
-            # Since grad_u depends on w, u_new also depends on w!
-            u = u - lr * grad_u
+            # Adam step (this is differentiable!)
+            opt.step()
             
             if verbose and iter % 20 == 0:
                 with torch.no_grad():
                     print(f"    Inner iter {iter}: loss = {loss.item():.6f}")
         
-        # u now has gradient w.r.t. w through entire optimization chain
-        return u
+        print(f"    Final inner loss: {loss.item():.6f}")
+
+        # Return u* with gradient w.r.t. w
+        return u_param
+    
+    def _solve_trajectory_implicit(
+        self,
+        w: torch.Tensor,
+        q0: torch.Tensor,
+        v0: torch.Tensor,
+        pusher0: torch.Tensor,
+        goal: torch.Tensor,
+        obstacle_pos: Optional[torch.Tensor],
+        u_init: Optional[torch.Tensor],
+        max_iters: int,
+        lr: float,
+        verbose: bool
+    ) -> torch.Tensor:
+        """
+        Implicit differentiation: Fast forward, custom backward.
+        
+        Stage 1 (Forward): Solve u* WITHOUT gradient tracking
+        Stage 2 (Backward): Compute ∂u*/∂w via implicit function theorem
+        """
+        # Use standard optimization (fast, no gradient tracking)
+        u_star = self._solve_trajectory_standard(
+            w, q0, v0, pusher0, goal, obstacle_pos, u_init, max_iters, lr, verbose
+        )
+        
+        # Wrap with custom autograd function
+        u_star_with_grad = ImplicitGradient.apply(
+            u_star, w, q0, v0, pusher0, goal, obstacle_pos, self
+        )
+        
+        return u_star_with_grad
     
     def _weighted_rollout(
         self,
@@ -514,6 +683,12 @@ class IRLWeightRecovery:
         Returns:
             loss: Weighted total cost
         """
+        # # Debug
+        # print(f"[_weighted_rollout] Inputs:")
+        # print(f"  u_seq.requires_grad: {u_seq.requires_grad}")
+        # print(f"  w.requires_grad: {w.requires_grad}")
+        # print(f"  w[0].requires_grad: {w[0].requires_grad}")
+        
         loss, q_final, lambdas, phis, qs, pusher_traj, \
             goal_term, orient_term, ctrl_term, v_term, obs_term, pen_term = rollout(
                 u_seq, q0, v0, pusher0,
@@ -527,6 +702,10 @@ class IRLWeightRecovery:
                 obstacle_pos=obstacle_pos,
                 device=self.device
             )
+        
+        # print(f"[_weighted_rollout] After rollout:")
+        # print(f"  loss.requires_grad: {loss.requires_grad}")
+        # print(f"  loss.grad_fn: {loss.grad_fn}")
         
         return loss
     

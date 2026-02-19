@@ -114,18 +114,23 @@ def recover_weights_from_demo(
     opts = IRLOptions(
         max_outer_iters=50,
         max_inner_iters=100,
-        lr_weights=0.01,
+        lr_weights=1.0,
         lr_trajectory=0.01,
         method=method,
         weight_tol=1e-4,
         control_tol=1e-3,
         warm_start_inner=True,
-        verbose=True
+        verbose=True,
+        use_lr_scheduler=True,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=10,
+        lr_scheduler_min_lr=1e-6,
+        use_implicit_diff=False
     )
-    
+
     # Recover weights
     irl_result = irl.recover_weights(demo, opts=opts)
-    
+
     return irl_result
 
 
@@ -151,6 +156,9 @@ def compare_weights(w_true: dict, w_recovered: torch.Tensor, feature_names: list
     
     # Normalize true weights for fair comparison
     w_true_norm = w_true_tensor / w_true_tensor.sum()
+    
+    # Move to same device as w_recovered for comparison
+    w_true_norm = w_true_norm.to(w_recovered.device)
     
     total_error = 0.0
     for i, name in enumerate(feature_names):
@@ -303,43 +311,128 @@ def main():
     )
     
     # Optionally save demonstration
-
-    #save_demo_npz(demo, demo_path)
-    #print(f"\nDemonstration saved to: {demo_path}")
+    demo_path = "./result/irl/demo.npz"
+    Path(demo_path).parent.mkdir(parents=True, exist_ok=True)
+    save_demo_npz(demo, demo_path)
+    print(f"\nDemonstration saved to: {demo_path}")
     
     # ========== Recover Weights ==========
     
-    # Method 1: Feature Matching (faster, simpler)
     print("\n\n")
-    irl_result_fm = recover_weights_from_demo(
+    irl_result = recover_weights_from_demo(
         optimizer, demo, method="control_matching"
     )
-    
-    # Method 2: Control Matching (more accurate, slower)
-    # Note: This requires backprop through entire optimization!
-    # print("\n\n")
-    # irl_result_cm = recover_weights_from_demo(
-    #     optimizer, demo, method="control_matching"
-    # )
     
     # ========== Analysis ==========
     
     feature_names = ['w_target', 'w_orient', 'w_v', 'w_ctrl', 'w_obs']
     
     # Compare weights
-    print("\n\nFEATURE MATCHING RESULTS:")
-    compare_weights(w_true, irl_result_fm['w_recovered'], feature_names)
+    print("\n\nCONTROL MATCHING RESULTS:")
+    compare_weights(w_true, irl_result['w_recovered'], feature_names)
+
+    # ========== Visualize Recovered Policy ==========
+    
+    print("\n\n" + "="*80)
+    print("GENERATING TRAJECTORY WITH RECOVERED WEIGHTS")
+    print("="*80)
+    
+    # Extract recovered weights
+    w_recovered = irl_result['w_recovered'].cpu().numpy()
+    
+    # Denormalize weights (scale to match original scale)
+    w_scale = 20.0 / w_recovered[0] if w_recovered[0] > 0 else 1.0
+    w_scale = 1.0    
+    w_recovered_scaled = w_recovered * w_scale
+    
+    print(f"Recovered weights (normalized): {w_recovered}")
+    print(f"Recovered weights (scaled): {w_recovered_scaled}")
+    
+    # Generate trajectory with recovered weights
+    u_init_recovered = optimizer.compute_geometric_initial_trajectory(
+        robot_pos=pusher0,
+        box_pos=q0,
+        goal_pos=goal
+    )
+    
+    result_recovered = optimizer.optimize(
+        q0=q0, v0=v0, pusher0=pusher0, goal=goal,
+        w_target=w_recovered_scaled[0],
+        w_orient=w_recovered_scaled[1],
+        w_v=w_recovered_scaled[2],
+        w_ctrl=w_recovered_scaled[3],
+        w_obs=w_recovered_scaled[4],
+        u_init=u_init_recovered,
+        obstacle_pos=obstacle_pos,
+        max_iters=100,
+        lr=0.01,
+        lr_decay_gamma=0.5,
+        lr_decay_step=20,
+        verbose=True
+    )
+    
+    print(f"\nRecovered policy trajectory:")
+    print(f"  Final loss: {result_recovered['loss']:.6f}")
+    print(f"  Final position: {result_recovered['q_final']}")
+    print(f"  Goal: {goal}")
+    print(f"  Position error: {np.linalg.norm(result_recovered['q_final'][:2] - np.array(goal[:2])):.6f}")
+    
+    # Visualize recovered trajectory
+    from trajectory_opt_with_contact import visualize_result
+    
+    print("\n" + "="*80)
+    print("VISUALIZING RECOVERED POLICY")
+    print("="*80)
+    
+    visualize_result(
+        result_recovered,
+        goal,
+        half_size=optimizer.half,
+        save_trajectory='./result/irl/recovered_trajectory.png',
+        save_animation='./result/irl/recovered_animation.mp4',
+        save_analysis='./result/irl/recovered_analysis.png',
+        obstacle_pos=obstacle_pos,
+        xlim=(-0.5, 0.6),
+        ylim=(-0.5, 0.6)
+    )
+    
+    # Also visualize expert for comparison
+    print("\n" + "="*80)
+    print("VISUALIZING EXPERT POLICY (for comparison)")
+    print("="*80)
+    
+    visualize_result(
+        expert_result,
+        goal,
+        half_size=optimizer.half,
+        save_trajectory='./result/irl/expert_trajectory.png',
+        save_animation='./result/irl/expert_animation.mp4',
+        save_analysis='./result/irl/expert_analysis.png',
+        obstacle_pos=obstacle_pos,
+        xlim=(-0.5, 0.6),
+        ylim=(-0.5, 0.6)
+    )
     
     # Plot convergence
-    plot_irl_convergence(irl_result_fm, save_path="/home/claude/irl_convergence.png")
+    plot_irl_convergence(irl_result, save_path="./result/irl/irl_convergence.png")
     
-    # Plot feature comparison
-    plot_feature_comparison(irl_result_fm, feature_names, 
-                           save_path="/home/claude/feature_comparison.png")
-    
+    # Plot feature comparison if available
+    if 'features_demo' in irl_result:
+        plot_feature_comparison(irl_result, feature_names,
+                               save_path="./result/irl/feature_comparison.png")
+
     print("\n" + "="*80)
     print("EXAMPLE COMPLETE")
     print("="*80)
+    print("\nGenerated files:")
+    print("  - ./result/irl/demo.npz")
+    print("  - ./result/irl/irl_convergence.png")
+    print("  - ./result/irl/expert_trajectory.png")
+    print("  - ./result/irl/expert_animation.mp4")
+    print("  - ./result/irl/expert_analysis.png")
+    print("  - ./result/irl/recovered_trajectory.png")
+    print("  - ./result/irl/recovered_animation.mp4")
+    print("  - ./result/irl/recovered_analysis.png")
 
 
 if __name__ == "__main__":
