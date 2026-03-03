@@ -335,7 +335,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
 
         # Free prediction & cheap skip
         q_free = qk + hT * vk
-        cnt_free = obb_contact_blend2(q_free, pusher_pos_next, halfT)   # user-provided
+        cnt_free = obb_contact_blend2(q_free, pusher_pos_next, halfT, sharpness=smooth_sdf)   # user-provided
         if cnt_free.phi > skip_solving_threshold:
             # no-contact branch: semi-implicit Euler with mild damping
             c_lin_coeff = c_linT / mT if enable_viscous_ground_friction else torch.tensor(0.0, dtype=dtype, device=device)
@@ -399,7 +399,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
         def residual(z):
             _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
 
-            cnt = obb_contact_blend2(_q, pusher_pos_next, halfT)  # user-provided, differentiable
+            cnt = obb_contact_blend2(_q, pusher_pos_next, halfT, sharpness=smooth_sdf)  # user-provided, differentiable
             n, t, r_cp = cnt.normal, cnt.tangent, cnt.r_cp
             Jn, Jt = contact_jacobians(n, t, r_cp)      # user-provided
 
@@ -445,7 +445,7 @@ class StepSquarePosIPFn(torch.autograd.Function):
             """
 
             # --- 1. Compute geometry (same as forward residual) ---
-            cnt = obb_contact_blend2(q, pusher_pos, halfT)
+            cnt = obb_contact_blend2(q, pusher_pos, halfT, sharpness=smooth_sdf)
             n  = cnt.normal
             t  = cnt.tangent
             r_cp = cnt.r_cp
@@ -604,49 +604,39 @@ class StepSquarePosIPFn(torch.autograd.Function):
                 )
                 z = zNew.detach()
 
-        if J_last is None:
-            # Compute final Jacobian: analytical or autograd
-            _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
-            if jacobian_type == "analytical":
-                
-                J = analytical_jacobian.compute_jacobian(z, R,
-                        pusher_pos=pusher_pos_next
-                    )
-                J_last = J.detach()
-            elif jacobian_type == "hybrid":
-                with torch.enable_grad():
-                        q_req = _q.detach().clone().requires_grad_(True)
-                        v_req = _v.detach().clone().requires_grad_(True)
-                        lamN_req = _lamN.detach().clone().requires_grad_(False)
-                        beta_req = _beta.detach().clone().requires_grad_(False)
-
-                        cnt, geom_grads = compute_geom_grads(
-                            q_req, v_req, lamN_req, beta_req, pusher_pos_next, u_push, halfT
-                        )
-
-                # Now compute hybrid Jacobian using this geometry info
-                J = hybrid_jacobian.compute_jacobian(
-                    z,
-                    qk=qk,
-                    vk=vk,
-                    u=u_push,
-                    cnt=cnt,
-                    geom_grads=geom_grads,
+        # Always recompute J at the converged z* for IFT accuracy.
+        # J_last from Newton loop is at z_{k-1} (before the final update),
+        # NOT at the actual solution z*. This causes systematic IFT gradient errors.
+        _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
+        if jacobian_type == "analytical":
+            J = analytical_jacobian.compute_jacobian(z, residual(z),
+                    pusher_pos=pusher_pos_next)
+            J_last = J.detach()
+        elif jacobian_type == "hybrid":
+            with torch.enable_grad():
+                q_req = _q.detach().clone().requires_grad_(True)
+                v_req = _v.detach().clone().requires_grad_(True)
+                lamN_req = _lamN.detach().clone().requires_grad_(False)
+                beta_req = _beta.detach().clone().requires_grad_(False)
+                cnt, geom_grads = compute_geom_grads(
+                    q_req, v_req, lamN_req, beta_req, pusher_pos_next, u_push, halfT
                 )
-                J_last = J.detach()
-            else:
-                # Use PyTorch autograd (original method)
-                z_req = z.detach().requires_grad_(True)
-                with torch.enable_grad():
-                    R = residual(z_req)
-                    J = torch.autograd.functional.jacobian(
-                        residual,
-                        z_req,
-                        strict=False,
-                        create_graph=False,
-                        vectorize=True,
-                    )
-                J_last = J.reshape(R.numel(), z_req.numel()).detach()
+            J = hybrid_jacobian.compute_jacobian(
+                z, qk=qk, vk=vk, u=u_push, cnt=cnt, geom_grads=geom_grads,
+            )
+            J_last = J.detach()
+        else:
+            # autograd: recompute J at z* with grad enabled
+            z_req = z.detach().requires_grad_(True)
+            with torch.enable_grad():
+                R_star = residual(z_req)
+                J = torch.autograd.functional.jacobian(
+                    residual, z_req,
+                    strict=False, create_graph=False, vectorize=True,
+                )
+            J_last = J.reshape(R_star.numel(), z_req.numel()).detach()
+            
+
 
         # at end of forward, after you have z and J_last
         q_next = z[0:3]
@@ -742,150 +732,136 @@ class StepSquarePosIPFn(torch.autograd.Function):
 
         
 
-        # ---- Rebuild residual at (z*, params) with graph disabled for z ----
-        def unpack(z):
-            _q = z[0:3]
-            _v = z[3:6]
-            _lamN = z[6]
-            _beta = z[7:9]
-            _r = z[9]
-            _y = z[10]
-            _s = z[11]
-            _w = z[12:14]
-            return _q, _v, _lamN, _beta, _r, _y, _s, _w
+        # ============================================================
+        # IFT Backward (IPM branch)
+        # ============================================================
+        # IFT formula:
+        #   ∂L/∂θ = (∂g/∂θ)ᵀ·λ_out  -  (∂R/∂θ)ᵀ·w
+        #   where  w = J⁻ᵀ · (∂g/∂z)ᵀ·λ_out
+        #
+        # g(z,θ): outputs = (q_next=z[0:3], v_next=z[3:6],
+        #                    pusher_next=pusher_pos+h*u_push,
+        #                    lam_vec=[z[6], z[7]-z[8]], phi=z[10])
+        # R(z,θ): residual (=0 at z*)
+        # θ     = (qk, vk, pusher_pos, u_push)
+        # J     = ∂R/∂z at z*  (cached from forward, shape nz×nz)
+        #
+        # Key observation:
+        #   q_next, v_next, lam_vec, phi  depend only on z  → ∂g/∂θ has contribution
+        #                                                        only from pusher_next
+        #   pusher_next = pusher_pos + h*u_push             → ∂g/∂pusher_pos = I
+        #                                                       ∂g/∂u_push    = h*I
+        #                                                       ∂g/∂qk = ∂g/∂vk = 0
+        # ============================================================
 
-        def residual(z, qk_, vk_, pusher_pos_, u_push_, h_, m_, Izz_, half_, mu_):
-            # Same as in forward (keep params explicit)
-            
+        def unpack_z(z):
+            return z[0:3], z[3:6], z[6], z[7:9], z[9], z[10], z[11], z[12:14]
+
+        def residual_fn(z, qk_, vk_, pusher_pos_, u_push_, h_, m_, Izz_, half_, mu_):
+            """R(z, θ) — same as forward residual."""
             pusher_next = pusher_pos_ + h_ * u_push_
+            _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack_z(z)
 
-            _q, _v, _lamN, _beta, _r, _y, _s, _w = unpack(z)
-
-            cnt = obb_contact_blend2(_q, pusher_next, half_)  # differentiable
+            cnt = obb_contact_blend2(_q, pusher_next, half_, sharpness=C["smooth_sdf"])
             n, t, r_cp = cnt.normal, cnt.tangent, cnt.r_cp
             Jn, Jt = contact_jacobians(n, t, r_cp)
 
-            v_cp = _v[0:2] + _v[2] * perp(r_cp)
+            v_cp    = _v[0:2] + _v[2] * perp(r_cp)
             v_rel_t = torch.dot(t, v_cp - u_push_)
             v_facets = torch.stack([v_rel_t, -v_rel_t])
 
             lamT_total = _beta[0] - _beta[1]
-            impulse = Jn * _lamN + Jt * lamT_total
-
+            impulse    = Jn * _lamN + Jt * lamT_total
+            
             Fg = torch.zeros(3, dtype=dtype, device=device)
             if C["enable_viscous_ground_friction"] and (C["c_lin"] > 0.0 or C["c_ang"] > 0.0):
-                Fg = torch.stack([
-                    -c_linT * _v[0],
-                    -c_linT * _v[1],
-                    -c_angT * _v[2],
-                ])
+                Fg = torch.stack([-c_linT*_v[0], -c_linT*_v[1], -c_angT*_v[2]])
 
             dv = M_inv @ (impulse + h_ * Fg)
 
-            r_dyn = _v - vk_ - dv
-            r_kin = _q - qk_ - h_ * _v
-            r_gap = _y - cnt.phi
+            r_dyn  = _v - vk_ - dv
+            r_kin  = _q - qk_ - h_ * _v
+            r_gap  = _y - cnt.phi
             r_cone = _s - (mu_ * _lamN - torch.sum(_beta))
             r_slip = _w - (v_facets + _r)
-
-
-            r_c1 = _y * _lamN - target_muT
-            r_c2 = _r * _s - target_muT
-            r_c3 = _beta * _w - target_muT
+            r_c1   = _y * _lamN - target_muT
+            r_c2   = _r * _s   - target_muT
+            r_c3   = _beta * _w - target_muT
 
             return torch.cat([r_dyn, r_kin, r_gap.view(1), r_cone.view(1), r_slip,
                               r_c1.view(1), r_c2.view(1), r_c3])
 
-        # Outputs g(z, params): (q_next, v_next, pusher_pos_next, lam_vec, phi)
-        def outputs_from(z, qk_, vk_, pusher_pos_, u_push_, h_):
-            q_next_ = z[0:3]
-            v_next_ = z[3:6]
-            lamN_   = z[6]
-            beta_   = z[7:9]
-            y_      = z[10]
-            #print("grad_enabled:", torch.is_grad_enabled())
-            lam_t_  = beta_[0] - beta_[1]
-            lam_vec_ = torch.stack([lamN_, lam_t_])
-            phi_    = y_
-            pusher_next_ = pusher_pos_ + h_ * u_push_
-            #ic(pusher_pos_.requires_grad,h_.requires_grad, u_push_.requires_grad)
-            return q_next_, v_next_, pusher_next_, lam_vec_, phi_
-
-        # Build J = dR/dz at solution
         z_star = ctx.z_star
-        J = ctx.J  # cached from forward, shape (nz, nz)
-        reg = 1e-8 * torch.eye(J.shape[0], dtype=dtype, device=device)
+        J      = ctx.J                                              # (nz, nz)
+        nz     = J.shape[0]
+        reg    = 1e-8 * torch.eye(nz, dtype=dtype, device=device)
 
-        # we still need a grad-enabled copy of z_star for outputs_from:
-        z_star_req = z_star.detach().requires_grad_(True)
+        # ── STEP 1: w = J⁻ᵀ · (∂g/∂z)ᵀ·λ_out ─────────────────────
+        # g(z) = (z[0:3], z[3:6], [z[6], z[7]-z[8]], z[10])
+        # (∂g/∂z)ᵀ·λ_out : assemble as sparse vjp over z
+        z_req = z_star.detach().requires_grad_(True)
         with torch.enable_grad():
-            qn, vn, pn, lamv, ph = outputs_from(
-                z_star_req, qk.detach(), vk.detach(),
-                pusher_pos.detach(), u_push.detach(), hT.detach()
-            )
-        reg = 1e-8 * torch.eye(J.shape[0], dtype=dtype, device=device)
-        # g_z^T * lambda  (lambda = upstream adjoints on outputs except pusher which is handled separately)
+            lamN_z   = z_req[6]
+            beta_z   = z_req[7:9]
+            lam_vec_z = torch.stack([lamN_z, beta_z[0] - beta_z[1]])
+            phi_z    = z_req[10]
+            g_z_vec  = torch.autograd.grad(
+                outputs      = (z_req[0:3], z_req[3:6], lam_vec_z, phi_z),
+                inputs       = z_req,
+                grad_outputs = (grad_q_next, grad_v_next, grad_lam_vec, grad_phi),
+                retain_graph = False,
+                allow_unused = False,
+            )[0]   # (nz,)
+        w = torch.linalg.solve(J.T + reg, g_z_vec)   # (nz,)
+
+        # ── STEP 2: (∂g/∂θ)ᵀ·λ_out ─────────────────────────────────
+        # Only pusher_next depends on θ directly:
+        #   ∂L_g/∂pusher_pos = grad_pusher_pos_next
+        #   ∂L_g/∂u_push     = h * grad_pusher_pos_next
+        #   ∂L_g/∂qk = ∂L_g/∂vk = 0
+        gz_pn = grad_pusher_pos_next if grad_pusher_pos_next is not None \
+                else torch.zeros_like(pusher_pos)
+        g_theta_pusher = gz_pn
+        g_theta_u      = gz_pn * hT
+        g_theta_qk     = torch.zeros_like(qk)
+        g_theta_vk     = torch.zeros_like(vk)
+
+        # ── STEP 3: (∂R/∂θ)ᵀ·w ─────────────────────────────────────
+        # [FIX] qk, vk가 rollout에서 requires_grad=False로 오는 경우를 처리.
+        #        항상 새 leaf로 만들어서 R을 θ에 대해 미분.
+        qk_leaf = qk.detach().requires_grad_(True)
+        vk_leaf = vk.detach().requires_grad_(True)
+        pu_leaf = pusher_pos.detach().requires_grad_(True)
+        u_leaf  = u_push.detach().requires_grad_(True)
+
         with torch.enable_grad():
-            qn, vn, pn, lamv, ph = outputs_from(z_star_req, qk.detach(), vk.detach(),
-                                            pusher_pos.detach(), u_push.detach(), hT.detach())
-        g_z_T_lambda = torch.autograd.grad(
-            outputs= (qn, vn, lamv, ph),
-            inputs = z_star_req,
-            grad_outputs=(grad_q_next, grad_v_next, grad_lam_vec, grad_phi),
-            retain_graph=False, allow_unused=False
-            )[0]  # (nz,)
-
-        # Solve (J^T) w = g_z^T lambda
-        # Small dense system -> direct solve
-        w = torch.linalg.solve(J.T + reg, g_z_T_lambda)
-
-        # g_theta^T * lambda (includes pusher_pos_next term for u_push & h)
-        z_star_req2 = z_star.detach().requires_grad_(True)
-        with torch.enable_grad():
-            qn, vn, pn, lamv, ph = outputs_from(z_star_req2, qk.detach(), vk.detach(),
-                                                pusher_pos, u_push, hT.detach())
-        # Params we support grads for:
-        params = [qk, vk, pusher_pos, u_push] #, hT, mT, IzzT, halfT, muT]
-
-        # ic(qk.requires_grad, vk.requires_grad, pusher_pos.requires_grad, u_push.requires_grad) #, hT.requires_grad, mT.requires_grad, IzzT.requires_grad, halfT.requires_grad, muT.requires_grad)
-        # ic(qn.requires_grad, vn.requires_grad, pn.requires_grad, lamv.requires_grad, ph.requires_grad)
-        
-
-        g_theta_T_lambda = torch.autograd.grad(
-            outputs=(qn, vn, pn, lamv, ph),
-            inputs=params,
-            grad_outputs=(grad_q_next, grad_v_next, grad_pusher_pos_next, grad_lam_vec, grad_phi),
-            retain_graph=False, allow_unused=True
-        )
-
-        z_star_req_no = z_star.detach().requires_grad_(False)  # z is fixed at the solution here
-        with torch.enable_grad():
-            R_star_w = residual(
-                z_star_req_no,            # treat z* as constant when differentiating wrt params
-                qk, vk, pusher_pos, u_push,   # <-- NOT detached
-                hT, mT, IzzT, halfT, muT      # <-- NOT detached
+            R_at_star = residual_fn(
+                z_star.detach(),          # z는 상수 (implicit variable)
+                qk_leaf, vk_leaf, pu_leaf, u_leaf,
+                hT, mT, IzzT, halfT, muT,
             )
 
-        # R_theta^T * w
         R_theta_T_w = torch.autograd.grad(
-            outputs=R_star_w,
-            inputs=params,
-            grad_outputs=w,
-            retain_graph=False, allow_unused=True
+            outputs      = R_at_star,
+            inputs       = (qk_leaf, vk_leaf, pu_leaf, u_leaf),
+            grad_outputs = w,
+            retain_graph = False,
+            allow_unused = True,
         )
 
-        # Final param grads
-        grads = []
-        for gt, rt in zip(g_theta_T_lambda, R_theta_T_w):
-            if gt is None and rt is None:
-                grads.append(None)
-            else:
-                gt = torch.zeros_like(rt) if gt is None else gt
-                rt = torch.zeros_like(gt) if rt is None else rt
-                grads.append(gt - rt)
+        def _safe(g, ref):
+            return torch.zeros_like(ref) if g is None else g
 
-        # Return grads matching forward inputs:
-        g_qk, g_vk, g_pusher, g_u = grads #, g_h, g_m, g_Izz, g_half, g_mu
+        R_qk = _safe(R_theta_T_w[0], qk)
+        R_vk = _safe(R_theta_T_w[1], vk)
+        R_pu = _safe(R_theta_T_w[2], pusher_pos)
+        R_u  = _safe(R_theta_T_w[3], u_push)
+
+        # ── STEP 4: 최종 gradient ────────────────────────────────────
+        g_qk     = g_theta_qk     - R_qk
+        g_vk     = g_theta_vk     - R_vk
+        g_pusher = g_theta_pusher - R_pu
+        g_u      = g_theta_u      - R_u
 
         # The rest (non-tensor hyperparameters) have no gradients
         return (g_qk, g_vk, g_pusher, g_u,
@@ -968,7 +944,8 @@ def implicit_euler_defects(qk, vk, prk, uk,
 
 def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy, 
             w_target = 20.0, w_orient = 1.0, w_v = 0.1, w_ctrl = 1e-3, w_obs = 1.0,
-            qp_solver = None, dynamics_solver=None, obstacle_pos=None, device=None):
+            qp_solver = None, dynamics_solver=None, obstacle_pos=None, device=None,
+            ipm_opts=IPMOptions()):
     """
     Rollout a trajectory given control sequence.
     
@@ -1011,6 +988,7 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
     phis = []
     qs = [q0]
     qrobot_hist = [pr0]
+    ipm_opts = ipm_opts if ipm_opts is not None else IPMOptions()
     
     # CRITICAL: Initialize as PyTorch tensor, not Python scalar!
     obs_term = torch.tensor(0.0, dtype=q0.dtype, device=device)
@@ -1026,12 +1004,8 @@ def rollout(u_seq, q0, v0, pr0, horizon, h, m, Izz, half, mu, goal_xy,
         elif dynamics_solver == 'IP':
             q, v, pr, lamk, phik, z_prev = step_square_pos_ip(
                 q, v, pr, u_seq[k], h=h, m=m, Izz=Izz, half=half, mu=mu,
-                skip_solving_threshold = 0.003,
-                ipm_opts=IPMOptions(target_mu=1e-6, max_newton=20, tol=1e-3, smooth_sdf=50.0,
-                    enable_viscous_ground_friction=True,
-                    c_lin=1.0,
-                    c_ang=0.00667  # c_ang = c_lin * (Izz/m)
-                    ),
+                skip_solving_threshold=100.0,
+                ipm_opts=ipm_opts,
                 z_prev=z_prev
                 )
 
