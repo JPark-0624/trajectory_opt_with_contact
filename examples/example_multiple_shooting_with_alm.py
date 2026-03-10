@@ -1,131 +1,54 @@
 """
-Example usage for BlockMultipleShootingWithALM.
-
-This script is designed to "match" the interface of:
-  - multiple_shooting_with_alm.py (optimizer)
-  - visualizer.py (TrajectoryVisualizer / visualize_result)
-
-It demonstrates your incremental plan:
-
-Step 1 (default in this example):
-  - Single-shooting-equivalent by using blockSize=horizon (1 block).
-  - Terminal (x,y) enforced via ALM (hard-ish).
-  - Orientation NOT enforced via ALM yet.
-  - Defect ALM enabled (so the terminal knot cannot "cheat" without dynamics).
-
-How to switch to true block multi-shooting:
-  - Set blockSize=5 (or 10)
-  - Keep enableDefectALM=True
-  - Optionally enable terminal theta ALM.
-
-Outputs:
-  - trajectory_ms_alm.png
-  - analysis_ms_alm.png
-  - animation_ms_alm.mp4
+Clean example for Block Multiple Shooting with ALM
+- Automatic initialization (no manual uInit/prKnotInit setup)
+- Enhanced visualization with initial vs optimal comparison
 """
 
-import os
-import sys
-import numpy as np
 import torch
-
-# -----------------------------------------------------------------------------
-# Robust imports (works whether you run from repo root or as an installed module)
-# -----------------------------------------------------------------------------
-from trajectory_opt_with_contact import multiple_shooting_with_alm
+import numpy as np
+from trajectory_opt_with_contact.multiple_shooting_with_alm import (
+    BlockMultipleShootingWithALM,
+    ALMConfig,
+    CostWeights
+)
 from trajectory_opt_with_contact.dynamics import IPMOptions
 from trajectory_opt_with_contact.visualizer import visualize_result
 
 
-# -----------------------------------------------------------------------------
-# Simple geometric initializer (pusher position path -> velocity inputs)
-# -----------------------------------------------------------------------------
-def computeGeometricVelocityInit(pusher0, box0, goal, horizon, dt, contactOffset=1e-4):
-    """
-    Create a piecewise-linear pusher POSITION path: approach then push,
-    then convert it to VELOCITY inputs u[t] via finite difference.
-
-    Returns:
-      uInit: (T,2) velocities
-      pInit: (T+1,2) positions (for debugging)
-    """
-    p0 = np.array(pusher0[:2], dtype=float)
-    b0 = np.array(box0[:2], dtype=float)
-    g0 = np.array(goal[:2], dtype=float)
-
-    distToBox = np.linalg.norm(b0 - p0)
-    distBoxToGoal = np.linalg.norm(g0 - b0)
-    total = distToBox + distBoxToGoal + 1e-9
-
-    steps1 = max(5, min(horizon - 5, int(horizon * (distToBox / total))))
-    steps2 = horizon - steps1
-
-    # approach target: just shy of contact
-    dirToBox = (b0 - p0) / (distToBox + 1e-9)
-    pContact = b0 - dirToBox * contactOffset
-
-    # push target: just shy of goal alignment
-    dirToGoal = (g0 - b0) / (distBoxToGoal + 1e-9)
-    pFinal = g0 - dirToGoal * contactOffset
-
-    pList = [p0.copy()]
-    # phase 1
-    for i in range(steps1):
-        a = (i + 1) / steps1
-        p = (1 - a) * p0 + a * pContact
-        pList.append(p)
-    # phase 2
-    for i in range(steps2):
-        a = (i + 1) / steps2
-        p = (1 - a) * pContact + a * pFinal
-        pList.append(p)
-
-    pArr = np.stack(pList, axis=0)  # (T+1,2)
-    uArr = (pArr[1:] - pArr[:-1]) / dt  # (T,2)
-    return uArr.astype(np.float32), pArr.astype(np.float32)
-
-
-
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
 def main():
+    # Reproducibility
     torch.manual_seed(0)
     np.random.seed(0)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # -------------------------
-    # Problem definition
-    # -------------------------
-    # q0 = [0.0, 0.0, 0.0]    # object pose
-    # v0 = [0.0, 0.0, 0.0]     # object vel (unused by QS much)
-    # pr0 = [-0.3, 0.0]        # pusher start
-    # goal = [0.5, 0.0, 0.0]   # desired object pose
-
-    # Task 2: Diagonal push (uncomment to try)
-    q0 = [0.0, 0.0, 0.0]
-    v0 = [0.0, 0.0, 0.0]
-    pr0 = [0.3, -0.3]
-    goal = [-0.2, 0.5, -0.3]
-
-
-    horizon = 100
-    dt = 0.05
-
-    # -------------------------
-    # Step 1: single-shooting-equivalent
-    #   Use ONE block, but keep defect ALM ON so knots cannot cheat.
-    # -------------------------
-    blockSize = 20  # 1 block => equivalent to single shooting
-
-    ipmOpts = IPMOptions(target_mu=1e-6, max_newton=20, tol=1e-3, smooth_sdf=50.0, #smooth_sdf is unused
-                    enable_viscous_ground_friction=True,
-                    c_lin=1.0,
-                    c_ang=0.00667 ### c_ang = c_lin * (Izz/m)
-                    )  # use defaults from your dynamics
     
-    optimizer = multiple_shooting_with_alm.BlockMultipleShootingWithALM(
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # ========================================
+    # Problem Setup
+    # ========================================
+    q0 = [0.0, 0.0, 0.0]          # Initial: [x, y, theta]
+    v0 = [0.0, 0.0, 0.0]          # Initial velocity
+    pr0 = [-0.1, -0.3]             # Initial pusher position
+    goal = [0.2, 0.5, -0.3]      # Goal: [x, y, theta]
+    
+    horizon = 60                 # Time steps
+    dt = 0.05                     # 5 seconds total
+    blockSize = 60                # 5 blocks
+    
+    # ========================================
+    # Optimizer Setup
+    # ========================================
+    ipmOpts = IPMOptions(
+        target_mu=1e-4,           # Tight complementarity
+        max_newton=20,
+        tol=1e-6,
+        enable_viscous_ground_friction=True,
+        smooth_sdf=50.0,
+        c_lin=1.0,
+        c_ang=0.00667
+    )
+    
+    optimizer = BlockMultipleShootingWithALM(
         mass=1.0,
         sideLength=0.2,
         muFriction=0.5,
@@ -133,58 +56,42 @@ def main():
         dt=dt,
         blockSize=blockSize,
         device=device,
-        enableDefectALM=True,          # IMPORTANT for single-shooting-equivalent correctness
+        enableDefectALM=True,
         ipmWarmStart=True,
         ipmOpts=ipmOpts,
-        skipSolvingThreshold=0.003,
+        skipSolvingThreshold=100.0,
     )
-
-    # ALM configuration
-    cfg = multiple_shooting_with_alm.ALMConfig(
+    
+    # ========================================
+    # ALM & Cost Configuration
+    # ========================================
+    cfg = ALMConfig(
         outerIters=1,
-        innerIters=200,
-        useLbfgs=False,
+        innerIters=2,
+        useLbfgs=False,           # Use Adam
         lr=0.01,
-        # Defects (1 block => only one defect)
         rhoDefectInit=2.0,
         rhoDefectEta=2.0,
         rhoDefectMax=1e4,
         tolDefect=1e-3,
     )
-
-    # Soft costs (tune as needed)
-    w = multiple_shooting_with_alm.CostWeights(
-        wControl=1e-2,
-        wControlSmooth=0.0,
-        wObjVel=1.0,
-        wTargetXY=20.0,
-        wTargetOrient=0.5,
+    
+    w = CostWeights(
+        wControl=1e-2,            # Light control regularization
+        wControlSmooth=0.0,       # No smoothness penalty
+        wObjVel=1.0,              # Penalize object velocity
+        wTargetXY=20.0,           # Strong position tracking
+        wTargetOrient=0.5,        # Moderate orientation tracking
     )
-
-    # Initial guess (velocity)
-    uInitNp, pInitNp = computeGeometricVelocityInit(
-        pusher0=pr0,
-        box0=q0,
-        goal=goal,
-        horizon=horizon,
-        dt=dt,
-        contactOffset=1e-4,
-    )
-    uInit = torch.tensor(uInitNp, device=optimizer.device)
-
-    # Optional: initialize knots using the geometric position path
-    # For single block, we only need knot 0 and knot 1. We'll initialize knot 1
-    # by "pretending" object reaches goal (helps ALM start closer); defect ALM will correct it.
-    qKnotInit = torch.zeros(optimizer.numKnots, 3, device=optimizer.device)
-    prKnotInit = torch.zeros(optimizer.numKnots, 2, device=optimizer.device)
-    qKnotInit[0] = torch.tensor(q0, device=optimizer.device)
-    prKnotInit[0] = torch.tensor(pr0, device=optimizer.device)
-    qKnotInit[-1] = torch.tensor(goal, device=optimizer.device)
-    prKnotInit[-1] = torch.tensor(pInitNp[-1], device=optimizer.device)
-
-
-    # Run optimization
-    out = optimizer.optimize(
+    
+    # ========================================
+    # Optimize (CLEAN! No manual init needed)
+    # ========================================
+    print("\n" + "="*70)
+    print("Starting Block Multiple Shooting Optimization")
+    print("="*70)
+    
+    result = optimizer.optimize(
         q0=torch.tensor(q0, device=optimizer.device),
         v0=torch.tensor(v0, device=optimizer.device),
         pr0=torch.tensor(pr0, device=optimizer.device),
@@ -192,47 +99,55 @@ def main():
         goalTheta=float(goal[2]),
         cfg=cfg,
         w=w,
-        uInit=uInit,
-        qKnotInit=qKnotInit,
-        prKnotInit=prKnotInit,
+        track_gradients=True,     # Enable gradient tracking for visualization
+        # uInit and prKnotInit are auto-generated!
     )
-
-    uOpt = out["u_seq"]
-    qKnots = out["qKnots"]
-    prKnots = out["prKnots"]
-    qsOpt = out["trajectory"]
-
-    print(f"uOpt: {uOpt}")
-    print(f"qKnots: {qKnots}")
-    print(f"prKnots: {prKnots}")
-    print(f"qsOpt: {qsOpt}")
-
-    print("=" * 70)
-    print("Multiple-shooting-with-ALM (single-shooting-equivalent) complete")
-    print("=" * 70)
-    print(f"Device: {optimizer.device}")
-    print(f"Terminal XY residual norm (last outer): {out['history']['terminalXYNorm'][-1].item():.6e}")
-    print(f"Terminal knot (object): {qKnots[-1]}")
-    print(f"Goal: {goal}")
-
-
-    # Visualize
+    
+    # ========================================
+    # Print Results
+    # ========================================
+    print("\n" + "="*70)
+    print("Optimization Complete!")
+    print("="*70)
+    print(f"Final loss: {result['loss']:.4f}")
+    print(f"Terminal position: {result['trajectory'][-1]}")
+    print(f"Goal position: {goal}")
+    print(f"Position error: {np.linalg.norm(result['trajectory'][-1][:2] - goal[:2]):.6f} m")
+    print(f"Orientation error: {abs(result['trajectory'][-1][2] - goal[2]):.6f} rad")
+    
+    # Loss breakdown
+    comp = result['loss_components']
+    print("\nLoss Component Breakdown:")
+    print(f"  Total:           {comp['total']:.6f}")
+    print(f"  Control energy:  {comp['control_energy']*comp['w_control']:.6f}")
+    print(f"  Control smooth:  {comp['control_smooth']*comp['w_smooth']:.6f}")
+    print(f"  Object velocity: {comp['obj_vel']*comp['w_objvel']:.6f}")
+    print(f"  Target XY:       {comp['target_xy']*comp['w_targetxy']:.6f}")
+    print(f"  Target orient:   {comp['target_orient']*comp['w_orient']:.6f}")
+    print(f"  ALM defect:      {comp['alm_defect']:.6f}")
+    
+    # ========================================
+    # Visualize with Enhanced Visualizer
+    # ========================================
+    print("\n" + "="*70)
+    print("Generating Visualizations...")
+    print("="*70)
+    
     visualize_result(
-        out,
+        result,
         goal=goal,
         half_size=optimizer.half,
         save_trajectory="trajectory_ms_alm.png",
         save_analysis="analysis_ms_alm.png",
         save_animation="animation_ms_alm.mp4",
-        obstacle_pos=None,
         xlim=(-1.0, 1.0),
         ylim=(-1.0, 1.0),
     )
-
-    print("\n✓ Done! Generated:")
-    print("  - trajectory_ms_alm.png")
-    print("  - analysis_ms_alm.png")
-    print("  - animation_ms_alm.mp4")
+    
+    print("\n✅ All done! Check the output files:")
+    print("   - trajectory_ms_alm.png  (2x3 grid with gradients & loss breakdown)")
+    print("   - analysis_ms_alm.png    (detailed analysis)")
+    print("   - animation_ms_alm.mp4   (side-by-side: initial vs optimal)")
 
 
 if __name__ == "__main__":
