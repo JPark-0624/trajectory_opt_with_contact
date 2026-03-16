@@ -451,14 +451,147 @@ class DDPOptimizer:
     # Main optimization loop (same as iLQR.py lines 239-395)
     # ---------------------------------------------------------------
     
+    def compute_geometric_initial_trajectory(
+        self,
+        robot_pos,      # [x, y] - initial robot position
+        box_pos,        # [x, y] or [x, y, theta] - initial box position  
+        goal_pos,       # [x, y] or [x, y, theta] - goal position
+    ):
+        """
+        Create initial trajectory based on geometric path: Robot -> Box -> Goal
+        
+        Uses the optimizer's horizon, dt, and automatically.
+        
+        Args:
+            robot_pos: Initial robot position [x, y]
+            box_pos: Initial box position [x, y] or [x, y, theta] (only x, y used)
+            goal_pos: Goal position [x, y] or [x, y, theta] (only x, y used)
+        
+        Returns:
+            u_init: Initial control trajectory [horizon, n_u] as torch.Tensor
+        """
+        import numpy as np
+        
+        # Extract x, y only (handle both [x, y] and [x, y, theta])
+        if isinstance(robot_pos, torch.Tensor):
+            robot_pos = robot_pos.cpu().numpy()
+        if isinstance(box_pos, torch.Tensor):
+            box_pos = box_pos.cpu().numpy()
+        if isinstance(goal_pos, torch.Tensor):
+            goal_pos = goal_pos.cpu().numpy()
+            
+        robot_pos = np.array(robot_pos[:2])
+        box_pos = np.array(box_pos[:2])
+        goal_pos = np.array(goal_pos[:2])
+        
+        # Compute distances
+        dist_robot_to_box = np.linalg.norm(box_pos - robot_pos)
+        dist_box_to_goal = np.linalg.norm(goal_pos - box_pos)
+        total_dist = dist_robot_to_box + dist_box_to_goal
+        
+        if self.verbose:
+            print(f"\n[Geometric Init] Distance analysis:")
+            print(f"  Robot -> Box: {dist_robot_to_box:.4f} m")
+            print(f"  Box -> Goal: {dist_box_to_goal:.4f} m")
+            print(f"  Total: {total_dist:.4f} m")
+        
+        # Handle edge case: already at goal
+        if total_dist < 1e-6:
+            if self.verbose:
+                print(f"  Already at goal! Using zero controls.")
+            return torch.zeros(self.horizon, self.n_u, device=self.device, dtype=self.dtype)
+        
+        # Allocate timesteps proportionally to distances
+        min_steps = 5
+        if self.horizon < 2 * min_steps:
+            steps_phase1 = self.horizon // 2
+        else:
+            ratio = dist_robot_to_box / total_dist
+            steps_phase1 = int(self.horizon * ratio)
+            steps_phase1 = max(min_steps, min(self.horizon - min_steps, steps_phase1))
+        
+        steps_phase2 = self.horizon - steps_phase1
+        
+        if self.verbose:
+            print(f"  Phase 1 (approach): {steps_phase1} steps")
+            print(f"  Phase 2 (push): {steps_phase2} steps")
+        
+        # Phase 1: Robot approaches box
+        dir_to_box = (box_pos - robot_pos) / (dist_robot_to_box + 1e-8)
+        contact_offset = 0.0001  # Small offset to avoid collision
+        target_contact_pos = box_pos - dir_to_box * contact_offset
+        
+        displacement_phase1 = target_contact_pos - robot_pos
+        time_phase1 = steps_phase1 * self.dt
+        velocity_phase1 = displacement_phase1 / (time_phase1 + 1e-8)
+        
+        if self.verbose:
+            print(f"  Phase 1 velocity: [{velocity_phase1[0]:.3f}, {velocity_phase1[1]:.3f}] m/s")
+        
+        # Phase 2: Robot pushes box to goal
+        dir_to_goal = (goal_pos - box_pos) / (dist_box_to_goal + 1e-8)
+        displacement_phase2 = goal_pos - box_pos
+        time_phase2 = steps_phase2 * self.dt
+        velocity_phase2 = displacement_phase2 / (time_phase2 + 1e-8)
+        
+        # Scale down push velocity (more conservative)
+        push_scale = 0.8
+        velocity_phase2 = velocity_phase2 * push_scale
+        
+        if self.verbose:
+            print(f"  Phase 2 velocity: [{velocity_phase2[0]:.3f}, {velocity_phase2[1]:.3f}] m/s")
+        
+        # Create control trajectory
+        u_init = []
+        
+        # Phase 1: Approach box
+        for i in range(steps_phase1):
+            u_init.append([float(velocity_phase1[0]), float(velocity_phase1[1])])
+        
+        # Phase 2: Push box to goal
+        for i in range(steps_phase2):
+            u_init.append([float(velocity_phase2[0]), float(velocity_phase2[1])])
+        
+        # Smooth transition (optional)
+        transition_steps = min(5, steps_phase1 // 4, steps_phase2 // 4)
+        if transition_steps > 0:
+            for i in range(transition_steps):
+                alpha = (i + 1) / (transition_steps + 1)
+                idx = steps_phase1 - transition_steps + i
+                if 0 <= idx < steps_phase1:
+                    u_init[idx] = [
+                        float((1 - alpha) * velocity_phase1[0] + alpha * velocity_phase2[0]),
+                        float((1 - alpha) * velocity_phase1[1] + alpha * velocity_phase2[1])
+                    ]
+        
+        if self.verbose:
+            print(f"  Generated control trajectory: {len(u_init)} x {self.n_u}")
+            u_magnitudes = [np.linalg.norm(u) for u in u_init]
+            print(f"  Control magnitude range: [{min(u_magnitudes):.3f}, {max(u_magnitudes):.3f}]")
+        
+        # Convert to torch tensor
+        u_init_tensor = torch.tensor(u_init, device=self.device, dtype=self.dtype)
+        
+        return u_init_tensor
+    
     def optimize(
         self,
         x0: torch.Tensor,
         goal: torch.Tensor,
         U_init: Optional[torch.Tensor] = None,
+        use_geometric_init: bool = True,  # NEW: Auto geometric initialization
     ) -> Dict:
         """
         Main DDP optimization loop
+        
+        Args:
+            x0: Initial state [n_x]
+            goal: Goal state [n_x]
+            U_init: Optional initial control sequence [T, n_u]
+                   If None and use_geometric_init=True, uses geometric initialization
+                   If None and use_geometric_init=False, uses zero controls
+            use_geometric_init: If True and U_init is None, automatically generate
+                              geometric initialization for pusher system
         
         Returns:
             Dictionary with trajectory, controls, cost, etc.
@@ -470,13 +603,34 @@ class DDPOptimizer:
         
         # Initialize controls
         if U_init is None:
-            U = torch.zeros(T, self.n_u, device=self.device, dtype=self.dtype)
+            if use_geometric_init and self.n_x == 8 and self.n_u == 2:
+                # Geometric initialization for pusher system
+                # Extract positions from state
+                robot_pos = x0[6:8]  # Pusher position [px, py]
+                box_pos = x0[:2]     # Box position [x, y]
+                goal_pos = goal[:2]  # Goal box position [x, y]
+                
+                if self.verbose:
+                    print(f"\nUsing geometric initialization for pusher system...")
+                
+                U = self.compute_geometric_initial_trajectory(
+                    robot_pos=robot_pos,
+                    box_pos=box_pos,
+                    goal_pos=goal_pos,
+                )
+            else:
+                # Default: zero controls
+                U = torch.zeros(T, self.n_u, device=self.device, dtype=self.dtype)
         else:
             U = U_init.to(device=self.device, dtype=self.dtype)
         
         # Initial rollout
         with torch.no_grad():
             X, cost = self.rollout(x0, U)
+        
+        # Save initial trajectory for visualization comparison
+        X_init = X.clone()
+        U_init = U.clone()
         
         best_cost = cost.item()
         best_X = X.clone()
@@ -507,7 +661,7 @@ class DDPOptimizer:
                 X_new, U_new, cost_new = self.forward_pass(x0, X, U, K_list, k_list, alpha)
                 
                 # Accept if better than best so far (with small tolerance for numerical precision)
-                if cost_new < best_cost * (1 - 1e-10):
+                if cost_new < cost.item():
                     X, U, cost = X_new, U_new, torch.tensor(cost_new)
                     accepted = True
                     
@@ -540,16 +694,94 @@ class DDPOptimizer:
                     print("[DDP] Cost near zero, converged.")
                 break
         
+        # Compute final gradient (control gradient at optimal solution)
+        # This is for visualization/analysis, similar to multiple_shooting
+        final_grad_u = None
+        try:
+            # Create a copy of best_U that requires gradient
+            U_for_grad = best_U.clone().detach().requires_grad_(True)
+            
+            # Rollout with gradient tracking
+            X_for_grad, _ = self.rollout(x0, U_for_grad)
+            
+            # Compute total cost
+            total_cost = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            for t in range(self.horizon):
+                total_cost = total_cost + self.stage_cost_fn(X_for_grad[t], U_for_grad[t])
+            total_cost = total_cost + self.terminal_cost_fn(X_for_grad[-1], self.goal)
+            
+            # Backward to get gradient
+            total_cost.backward()
+            
+            if U_for_grad.grad is not None:
+                final_grad_u = U_for_grad.grad.detach().clone().cpu().numpy()
+        except Exception as e:
+            if self.verbose:
+                print(f"[DDP] Warning: Could not compute final gradient: {e}")
+
+
         if self.verbose:
             print(f"{'='*70}")
             print(f"Final cost: {best_cost:.6f}")
             print(f"{'='*70}\n")
         
+        # Extract trajectory components for visualization
+        # State format: [q(3), v(3), pusher_pos(2)] = [8]
+        q_traj = best_X[:, :3]      # [T+1, 3] box pose
+        v_traj = best_X[:, 3:6]     # [T+1, 3] box velocity
+        pusher_traj = best_X[:, 6:8]  # [T+1, 2] pusher position
+        
+        # Initial trajectory (from first rollout)
+        q_init = X_init[:, :3]
+        v_init = X_init[:, 3:6]
+        pusher_init = X_init[:, 6:8]
+        
+        # Contact forces (placeholder - DDP doesn't track these explicitly)
+        # For compatibility with visualizer, create dummy arrays
+        T = self.horizon
+        contact_forces = np.zeros((T, 4))  # [T, 4] - placeholder
+        signed_distances = np.zeros((T, 4))  # [T, 4] - placeholder
+        
+        
+
+        # Return format matching multiple_shooting_with_alm.py for visualizer compatibility
         return {
-            "trajectory": best_X.detach().cpu().numpy(),
-            "controls": best_U.detach().cpu().numpy(),
-            "cost": best_cost,
+            # Optimized trajectory (visualizer expects these keys)
+            "loss": best_cost,
+            "q_final": q_traj[-1].detach().cpu().numpy(),
+            "u_seq": best_U.detach().cpu().numpy(),
+            "trajectory": q_traj.detach().cpu().numpy(),
+            "velocity_trajectory": v_traj.detach().cpu().numpy(),
+            "pusher_trajectory": pusher_traj.detach().cpu().numpy(),
+            "contact_forces": contact_forces,  # Placeholder for visualizer
+            "signed_distances": signed_distances,  # Placeholder for visualizer
+            
+            # Initial trajectory for visualization comparison
+            "initial_trajectory": q_init.detach().cpu().numpy(),
+            "initial_velocity_trajectory": v_init.detach().cpu().numpy(),
+            "initial_pusher_trajectory": pusher_init.detach().cpu().numpy(),
+            
+            # **NEW: Final control gradient (last outer iter, last inner iter)**
+            "control_gradients": final_grad_u,
+
+            # Loss component breakdown (for visualizer)
+            "loss_components": {
+                "total": best_cost,
+                # DDP doesn't break down loss by component like ALM
+                # Placeholder for compatibility
+            },
+            
+            # DDP-specific data
             "K_gains": [K.detach().cpu().numpy() for K in K_list] if K_list else None,
+            "feedforward_gains": [k.detach().cpu().numpy() for k in k_list] if k_list else None,
+            
+            # Full state trajectory (for advanced analysis)
+            "full_trajectory": best_X.detach().cpu().numpy(),
+            
+            # Metadata
+            "method": "DDP",
+            "converged": best_cost < 1e-6 or it < self.max_iters - 1,
+            "iterations": it + 1,
         }
 
 
