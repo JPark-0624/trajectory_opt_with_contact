@@ -1,8 +1,8 @@
 """
-Single Shooting SQP with Moreau Solver
+Single Shooting SQP with Explicit Gauss-Newton Hessian
 
-Clean implementation matching the existing TrajectoryOptimizer API.
-Uses delta formulation for proper SQP.
+Implementation using residual Jacobian for P = J^T J approximation.
+Matches single_shooting_SQP_moreau.py structure exactly.
 """
 
 import torch
@@ -40,6 +40,10 @@ class SQPConfig:
     use_trust_region: bool = True
     trust_region_iters: int = 3
     trust_region_size: float = 0.5
+    
+    # Gauss-Newton Hessian
+    use_gauss_newton: bool = True
+    hessian_regularization: float = 1e-6
 
 
 @dataclass
@@ -52,11 +56,17 @@ class CostWeights:
     wTargetOrient: float = 0.5
 
 
-class SingleShootingSQP:
+class SingleShootingSQPGaussNewton:
     """
-    Single Shooting trajectory optimizer using SQP with Moreau solver.
+    Single Shooting SQP with explicit Gauss-Newton Hessian.
     
-    API matches existing TrajectoryOptimizer for easy comparison.
+    Uses residual formulation:
+        f(u) = (1/2) ||r(u)||²
+    
+    Hessian approximation:
+        P = J^T J  where J = ∂r/∂u
+    
+    Matches SingleShootingSQP API exactly.
     """
     
     def __init__(
@@ -67,7 +77,7 @@ class SingleShootingSQP:
         horizon: int,
         dt: float,
         device: str = "cpu",
-        dynamics_module = None,  # Passed in from existing code
+        dynamics_module = None,
         ipmOpts: Optional[IPMOptions] = None,
     ):
         self.mass = mass
@@ -79,11 +89,7 @@ class SingleShootingSQP:
         self.device = torch.device(device)
 
         self.ipmOpts = ipmOpts if ipmOpts is not None else IPMOptions()
-        
-        # Store dynamics module (step_square or step_square_IP)
         self.dynamics = dynamics_module
-        
-        # Moment of inertia
         self.Izz = (1.0/6.0) * mass * (side_length**2 + side_length**2)
     
     def forward_simulate(
@@ -94,27 +100,13 @@ class SingleShootingSQP:
         u: torch.Tensor,
         store_contact_data: bool = False,
     ) -> Tuple:
-        """
-        Forward simulation from initial state with controls u.
-        
-        Args:
-            store_contact_data: If True, return contact forces and signed distances
-        
-        Returns:
-            qs: (T+1, 3) object states
-            vs: (T+1, 3) object velocities  
-            prs: (T+1, 2) pusher positions
-            terminalVelEnergy: scalar (terminal velocity squared norm)
-            contact_forces: (T, 2) if store_contact_data else None
-            signed_distances: (T,) if store_contact_data else None
-        """
+        """Forward simulation from initial state with controls u."""
         T = self.horizon
         
         qs = [q0]
         vs = [v0]
         prs = [pusher0]
         
-        # Contact data storage
         if store_contact_data:
             contact_forces = []
             signed_distances = []
@@ -122,7 +114,6 @@ class SingleShootingSQP:
         q, v, pr = q0, v0, pusher0
         z_prev = None
         for t in range(T):
-            # Call dynamics (matches existing API)
             q_next, v_next, pr_next, lam, phi, z_prev = self.dynamics(
                 qk=q, vk=v, 
                 pusher_pos=pr, 
@@ -133,23 +124,21 @@ class SingleShootingSQP:
                 half=self.half,
                 mu=self.mu,
                 ipm_opts=self.ipmOpts,
-                z_prev = z_prev,
-                skip_solving_threshold = 100.0
+                z_prev=z_prev,
+                skip_solving_threshold=100.0
             )
             
             qs.append(q_next)
             vs.append(v_next)
             prs.append(pr_next)
             
-            # Store contact data
             if store_contact_data:
                 contact_forces.append(lam)
                 signed_distances.append(phi)
             
             q, v, pr = q_next, v_next, pr_next
         
-        # FIXED: Terminal velocity energy (not cumulative!)
-        terminalVelEnergy = (v ** 2).sum()  # v is final velocity after loop
+        terminalVelEnergy = (v ** 2).sum()
         
         qs_stacked = torch.stack(qs)
         vs_stacked = torch.stack(vs)
@@ -158,11 +147,12 @@ class SingleShootingSQP:
         if store_contact_data:
             contact_forces_stacked = torch.stack(contact_forces)
             signed_distances_stacked = torch.stack(signed_distances)
-            return qs_stacked, vs_stacked, prs_stacked, terminalVelEnergy, contact_forces_stacked, signed_distances_stacked
+            return qs_stacked, vs_stacked, prs_stacked, terminalVelEnergy, \
+                   contact_forces_stacked, signed_distances_stacked
         else:
             return qs_stacked, vs_stacked, prs_stacked, terminalVelEnergy, None, None
     
-    def evaluate_cost(
+    def compute_residuals(
         self,
         u: torch.Tensor,
         q0: torch.Tensor,
@@ -170,61 +160,113 @@ class SingleShootingSQP:
         pusher0: torch.Tensor,
         goal: torch.Tensor,
         w: CostWeights,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Evaluate cost for given controls.
+        Compute residual vector for Gauss-Newton.
+        
+        Residual structure:
+            r = [r_control, r_target_xy, r_orient, r_vel]
+        
+        where each component is scaled by sqrt(weight) so that:
+            f(u) = (1/2) ||r(u)||² = sum of weighted squared terms
+        """
+        # Forward simulate
+        qs, vs, _, terminalVelEnergy, _, _ = self.forward_simulate(
+            q0, v0, pusher0, u, store_contact_data=False
+        )
+        
+        qFinal = qs[-1]
+        vFinal = vs[-1]
+        
+        # --- Control residuals ---
+        # r_control = √wControl · u
+        r_control = torch.sqrt(torch.tensor(w.wControl, device=self.device)) * u.flatten()
+        
+        # --- Target XY residuals ---
+        # r_target = √wTarget · (q_final[:2] - goal[:2])
+        rXY = qFinal[:2] - goal[:2]
+        r_target = torch.sqrt(torch.tensor(w.wTargetXY, device=self.device)) * rXY
+        
+        # --- Orientation residual ---
+        # r_orient = √wOrient · wrap(q_final[2] - goal[2])
+        rTheta = wrap_to_pi(qFinal[2] - goal[2])
+        r_orient = torch.sqrt(torch.tensor(w.wTargetOrient, device=self.device)) * rTheta.unsqueeze(0)
+        
+        # --- Terminal velocity residuals ---
+        # r_vel = √wVel · v_final
+        r_vel = torch.sqrt(torch.tensor(w.wObjVel, device=self.device)) * vFinal
+        
+        # Concatenate all residuals
+        r = torch.cat([r_control, r_target, r_orient, r_vel])
+        
+        return r
+    
+    def compute_gauss_newton_hessian(
+        self,
+        u: torch.Tensor,
+        q0: torch.Tensor,
+        v0: torch.Tensor,
+        pusher0: torch.Tensor,
+        goal: torch.Tensor,
+        w: CostWeights,
+        regularization: float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """
+        Compute Gauss-Newton Hessian P = J^T J and gradient g.
         
         Returns:
-            loss: scalar
-            qs: (T+1, 3) trajectory
+            P: Hessian matrix (n, n) where n = 2T
+            g: Gradient vector (n,)
+            timing: Dict with timing breakdown
         """
-        qs, vs, prs, terminalVelEnergy, lamdas, phis = self.forward_simulate(
-            q0, v0, pusher0, u, store_contact_data=True
-        )
+        timing = {}
         
-        # Cost components
-        controlEnergy = (u ** 2).sum()
-        controlSmooth = ((u[1:] - u[:-1]) ** 2).sum() if len(u) > 1 else torch.zeros((), device=self.device)
+        # Require gradient for Jacobian computation
+        u_leaf = u.detach().requires_grad_(True)
         
-        # Terminal costs
-        qFinal = qs[-1]
+        with torch.enable_grad():
+            # Compute residuals
+            t0 = time.time()
+            r = self.compute_residuals(u_leaf, q0, v0, pusher0, goal, w)
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()  # ⭐ Wait for GPU completion
+            timing['residual_eval'] = time.time() - t0
+            
+            # Jacobian: J = ∂r/∂u (VECTORIZED for speed!)
+            t0 = time.time()
+            J = torch.autograd.functional.jacobian(
+                lambda u_: self.compute_residuals(
+                    u_.reshape(self.horizon, 2), q0, v0, pusher0, goal, w
+                ),
+                u_leaf.flatten(),
+                create_graph=False,
+                vectorize=True,  # ⭐ CRITICAL: 20× speedup!
+                strategy='reverse-mode',  # Leverages IFT backward
+            )
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()  # ⭐ Wait for GPU completion
+            timing['jacobian_computation'] = time.time() - t0
         
-        # Position error
-        rXY = qFinal[:2] - goal[:2]
-        targetCost = (rXY ** 2).sum()
+        # Gradient: g = J^T r
+        t0 = time.time()
+        g = J.T @ r.detach()
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()  # ⭐ Wait for GPU completion
+        timing['gradient_assembly'] = time.time() - t0
         
-        # Orientation error
-        terminalOrientNormSq = torch.zeros((), device=self.device)
-        rTh = wrap_to_pi(qFinal[2] - goal[2])
-        orientCost = rTh ** 2
+        # Gauss-Newton Hessian: P = J^T J
+        t0 = time.time()
+        P = J.T @ J
         
-        # Terminal velocity cost (already computed in forward_simulate)
-        terminalVelCost = terminalVelEnergy
+        # Add regularization for numerical stability
+        if regularization > 0:
+            P = P + regularization * torch.eye(P.shape[0], device=self.device, dtype=P.dtype)
         
-        loss = (
-            w.wControl * controlEnergy +
-            w.wControlSmooth * controlSmooth +
-            w.wObjVel * terminalVelCost +
-            w.wTargetXY * targetCost +
-            w.wTargetOrient * orientCost
-        )
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()  # ⭐ Wait for GPU completion
+        timing['hessian_assembly'] = time.time() - t0
         
-        return {
-            "qs": qs,
-            "vs": vs,
-            "qrobot_hist": prs,
-            "lamdas": lamdas,
-            "phis": phis,
-            "loss": loss,
-            "controlEnergy": controlEnergy,
-            "controlSmooth": controlSmooth,
-            "objVelEnergy": terminalVelCost,
-            "terminalXYNormSq": targetCost,
-            "terminalOrientNormSq": orientCost,
-            "terminalXYNorm": rXY.norm(),
-            "terminalThetaAbs": rTh.abs()    
-        }
-
+        return P, g, timing
     
     def build_qp_matrices(
         self,
@@ -237,42 +279,75 @@ class SingleShootingSQP:
         cfg: SQPConfig,
     ) -> Tuple:
         """
-        Build QP matrices for DELTA formulation.
+        Build QP matrices for DELTA formulation with Gauss-Newton Hessian.
         
         QP solves:
             minimize  (1/2) δu' P δu + g' δu
             s.t.      u_min ≤ u_curr + δu ≤ u_max
         
-        Returns: P, q, A, b, cones
+        Returns: P, q, A, b, cones, timing (matching Moreau solver interface)
         """
         T = self.horizon
-        n = T * 2  # Total variables (flattened u)
+        n = T * 2
         
-        # P MATRIX (Hessian approximation)
-        P_diag = np.full(n, w.wControl)
-        P = sparse.diags(P_diag, format='csr')
+        timing = {}
         
-        # q VECTOR (Gradient via autograd)
-        u_ad = u_curr.clone().detach().requires_grad_(True)
+        # --- COMPUTE HESSIAN AND GRADIENT ---
+        if cfg.use_gauss_newton:
+            # Gauss-Newton: P = J^T J
+            P_torch, g_torch, hess_timing = self.compute_gauss_newton_hessian(
+                u_curr, q0, v0, pusher0, goal, w,
+                regularization=cfg.hessian_regularization
+            )
+            timing.update(hess_timing)
+            
+            t0 = time.time()
+            P_np = P_torch.detach().cpu().numpy()
+            g_np = g_torch.detach().cpu().numpy()
+            timing['hessian_to_numpy'] = time.time() - t0
+        else:
+            # Fallback: Identity Hessian (steepest descent)
+            t0 = time.time()
+            # Compute gradient via autograd
+            u_ad = u_curr.clone().detach().requires_grad_(True)
+            qs, vs, prs, termVel, _, _ = self.forward_simulate(q0, v0, pusher0, u_ad, False)
+            
+            # Compute loss
+            controlEnergy = (u_ad ** 2).sum()
+            rXY = qs[-1][:2] - goal[:2]
+            targetCost = (rXY ** 2).sum()
+            rTh = wrap_to_pi(qs[-1][2] - goal[2])
+            orientCost = rTh ** 2
+            
+            loss = (
+                w.wControl * controlEnergy +
+                w.wObjVel * termVel +
+                w.wTargetXY * targetCost +
+                w.wTargetOrient * orientCost
+            )
+            loss.backward()
+            
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            g_np = u_ad.grad.cpu().numpy().flatten()
+            P_np = np.eye(n) * w.wControl  # Simple diagonal
+            timing['identity_hessian'] = time.time() - t0
         
-        result = self.evaluate_cost(u_ad, q0, v0, pusher0, goal, w)
-        loss = result["loss"]
-        loss.backward()
-        
-        grad_u = u_ad.grad.cpu().numpy().flatten()
-        q_vec = grad_u
-        
-        # CONSTRAINTS (box constraints on delta)
+        # --- CONSTRAINTS (box constraints on delta) ---
+        t0 = time.time()
         # u_min ≤ u_curr + δu ≤ u_max
-        # → (u_min - u_curr) ≤ δu ≤ (u_max - u_curr)
+        # Reformulate as: A δu + s = b, s ≥ 0
         
         constraint_rows = []
         constraint_rhs = []
         
+        u_curr_np = u_curr.cpu().numpy().flatten()
+        
         for t in range(T):
             for d in range(2):
                 idx = t * 2 + d
-                u_curr_val = u_curr[t, d].item()
+                u_curr_val = u_curr_np[idx]
                 
                 # Lower: -δu + s = u_curr - u_min
                 row_lower = np.zeros(n)
@@ -294,7 +369,60 @@ class SingleShootingSQP:
             num_nonneg_cones=T * 2 * 2,
         )
         
-        return P, q_vec, A, b, cones
+        # Convert P to sparse (Moreau expects sparse)
+        P_sparse = sparse.csr_matrix(P_np)
+        timing['constraint_assembly'] = time.time() - t0
+        
+        return P_sparse, g_np, A, b, cones, timing
+    
+    def evaluate_cost(
+        self,
+        u: torch.Tensor,
+        q0: torch.Tensor,
+        v0: torch.Tensor,
+        pusher0: torch.Tensor,
+        goal: torch.Tensor,
+        w: CostWeights,
+    ) -> Dict:
+        """Evaluate cost and return detailed breakdown."""
+        qs, vs, prs, terminalVelEnergy, _, _ = self.forward_simulate(
+            q0, v0, pusher0, u, store_contact_data=False
+        )
+        
+        # Cost components
+        controlEnergy = (u ** 2).sum()
+        controlSmooth = ((u[1:] - u[:-1]) ** 2).sum() if len(u) > 1 else torch.zeros((), device=self.device)
+        
+        qFinal = qs[-1]
+        rXY = qFinal[:2] - goal[:2]
+        targetCost = (rXY ** 2).sum()
+        
+        rTh = wrap_to_pi(qFinal[2] - goal[2])
+        orientCost = rTh ** 2
+        
+        terminalVelCost = terminalVelEnergy
+        
+        loss = (
+            w.wControl * controlEnergy +
+            w.wControlSmooth * controlSmooth +
+            w.wObjVel * terminalVelCost +
+            w.wTargetXY * targetCost +
+            w.wTargetOrient * orientCost
+        )
+        
+        return {
+            "loss": loss,
+            "qs": qs,
+            "vs": vs,
+            "prs": prs,
+            "controlEnergy": controlEnergy,
+            "controlSmooth": controlSmooth,
+            "terminalXYNormSq": targetCost,
+            "terminalOrientNormSq": orientCost,
+            "terminalVelEnergy": terminalVelEnergy,
+            "terminalXYNorm": torch.norm(rXY),
+            "terminalThetaAbs": torch.abs(rTh),
+        }
     
     def optimize(
         self,
@@ -308,12 +436,9 @@ class SingleShootingSQP:
         verbose: bool = True,
     ) -> Dict:
         """
-        Main SQP optimization loop.
+        Main SQP optimization loop with Gauss-Newton Hessian.
         
-        Args match existing TrajectoryOptimizer.optimize() API.
-        
-        Returns:
-            Dictionary with trajectories, controls, loss, etc.
+        Matches SingleShootingSQP.optimize() API exactly.
         """
         # Convert inputs to tensors
         q0 = self._to_tensor(q0)
@@ -329,43 +454,85 @@ class SingleShootingSQP:
         
         # Initialize controls
         if u_init is None:
-            u_curr = self._init_controls_simple(q0, goal)
+            # u_curr = self._init_controls_simple(q0, goal)
+            u_curr_np = self.compute_geometric_initial_trajectory(
+                robot_pos=pusher0.detach().cpu().numpy(),
+                box_pos = q0.detach().cpu().numpy(),
+                goal_pos=goal.detach().cpu().numpy()
+                )
+            u_curr = self._to_tensor(u_curr_np)
+            u_init_eval = u_curr
         else:
             u_curr = self._to_tensor(u_init)
+            u_init_eval = u_curr
         
         if verbose:
+            hess_type = "Gauss-Newton (P = J^T J)" if cfg.use_gauss_newton else "Identity (P = I)"
             print("\n" + "="*70)
-            print("Single Shooting SQP with Moreau")
+            print(f"Single Shooting SQP with {hess_type}")
             print("="*70)
             print(f"Horizon: {self.horizon}, dt: {self.dt}")
             print(f"Control bounds: [{cfg.u_min}, {cfg.u_max}]")
             print(f"Max iterations: {cfg.maxIters}")
+            if cfg.use_gauss_newton:
+                print(f"Hessian regularization: {cfg.hessian_regularization}")
+            
+            # GPU acceleration info
+            print(f"\n🚀 Acceleration:")
+            print(f"  PyTorch device: {self.device}")
+            if moreau.device_available('cuda'):
+                print(f"  Moreau CUDA: available ✓")
+            else:
+                print(f"  Moreau CUDA: not available (using CPU)")
+            print("="*70)
         
         cost_curr = None
         start_time = time.time()
         
-        # History tracking (matching MS)
+        # History tracking
         history = {
             'loss': [],
+            'grad_norm': [],
             'step_norm': [],
             'cost_change': [],
             'alpha': [],
+            # Timing breakdown per iteration
+            'time_hessian': [],
+            'time_qp': [],
+            'time_line_search': [],
+            'time_total_iter': [],
         }
         
         # SQP loop
         for iteration in range(cfg.maxIters):
+            iter_start_time = time.time()
+            
             if verbose:
                 print(f"\n{'='*70}")
                 print(f"SQP Iteration {iteration+1}/{cfg.maxIters}")
                 print(f"{'='*70}")
             
-            # Build and solve QP
-            P, q, A, b, cones = self.build_qp_matrices(
+            # --- STEP 1: Build and solve QP ---
+            hessian_start = time.time()
+            P, q, A, b, cones, qp_timing = self.build_qp_matrices(
                 u_curr, q0, v0, pusher0, goal, w, cfg
             )
+            hessian_time = time.time() - hessian_start
             
-            solver = moreau.Solver(P, q, A, b, cones=cones)
+            # Solve using Moreau conic solver with GPU acceleration
+            qp_start = time.time()
+            
+            # Configure Moreau to use GPU if available
+            moreau_device = 'cuda' if self.device.type == 'cuda' and moreau.device_available('cuda') else 'cpu'
+            moreau_settings = moreau.Settings(device=moreau_device)
+            
+            solver = moreau.Solver(P, q, A, b, cones=cones, settings=moreau_settings)
             solution = solver.solve()
+            
+            # Sync GPU if needed
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+            qp_time = time.time() - qp_start
             
             # Extract delta
             delta_u = torch.tensor(
@@ -374,37 +541,50 @@ class SingleShootingSQP:
                 dtype=torch.float64
             )
             
+            # Gradient norm (from q vector)
+            grad_norm = np.linalg.norm(q)
+            history['grad_norm'].append(grad_norm)
+            
+            if verbose:
+                print(f"  Gradient norm: {grad_norm:.6e}")
+                print(f"  ⏱ Timing:")
+                print(f"    Hessian+QP build: {hessian_time:.2f}s", end="")
+                if cfg.use_gauss_newton and 'jacobian_computation' in qp_timing:
+                    print(f" (Jacobian: {qp_timing['jacobian_computation']:.2f}s)")
+                else:
+                    print()
+                print(f"    QP solve:         {qp_time:.2f}s")
+            
             # Trust region (early iterations)
             if cfg.use_trust_region and iteration < cfg.trust_region_iters:
-                delta_norm = torch.norm(delta_u)
+                delta_norm = torch.norm(delta_u).item()
                 if delta_norm > cfg.trust_region_size:
-                    scale = cfg.trust_region_size / delta_norm
-                    delta_u = delta_u * scale
+                    delta_u = delta_u * (cfg.trust_region_size / delta_norm)
                     if verbose:
-                        print(f"  Trust region: scaled step from {delta_norm:.3f} to {cfg.trust_region_size:.3f}")
+                        print(f"  Trust region active: scaled to {cfg.trust_region_size:.3f}")
             
             u_qp = u_curr + delta_u
             step_norm = torch.norm(delta_u).item()
+            history['step_norm'].append(step_norm)
             
             if verbose:
-                print(f"  Step norm: {step_norm:.6f}")
+                print(f"  QP step norm: {step_norm:.6f}")
             
-            # Line search
+            # --- STEP 2: Line search ---
+            line_search_start = time.time()
             alpha_accepted = 1.0
             if cfg.use_line_search and cost_curr is not None:
                 alpha = 1.0
                 for ls_iter in range(cfg.line_search_max_iters):
                     u_trial = u_curr + alpha * delta_u
                     
-                    result = self.evaluate_cost(
-                        u_trial, q0, v0, pusher0, goal, w
-                    )
+                    result = self.evaluate_cost(u_trial, q0, v0, pusher0, goal, w)
                     cost_trial = result["loss"]
                     
                     # Armijo condition
                     if cost_trial < cost_curr:
                         if verbose:
-                            print(f"  Line search: α={alpha:.4f}, cost={cost_trial:.6f}")
+                            print(f"  Line search: α={alpha:.4f}, cost={cost_trial.item():.6f} (accepted)")
                         u_new = u_trial
                         cost_new = cost_trial
                         alpha_accepted = alpha
@@ -413,7 +593,7 @@ class SingleShootingSQP:
                         alpha *= cfg.line_search_beta
                         if ls_iter == cfg.line_search_max_iters - 1:
                             if verbose:
-                                print(f"  Line search failed, using α={alpha:.4f}")
+                                print(f"  Line search: α={alpha:.4f}, cost={cost_trial.item():.6f} (failed, using)")
                             u_new = u_trial
                             cost_new = cost_trial
                             alpha_accepted = alpha
@@ -423,126 +603,159 @@ class SingleShootingSQP:
                 result = self.evaluate_cost(u_new, q0, v0, pusher0, goal, w)
                 cost_new = result["loss"]
             
-            # Record history
-            history['loss'].append(cost_new.detach().cpu().numpy())
-            history['step_norm'].append(step_norm)
+            # Ensure GPU operations complete before timing
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()  # ⭐ Wait for line search to finish
+            line_search_time = time.time() - line_search_start
+            
+            # Record timing
+            iter_total_time = time.time() - iter_start_time
+            history['time_hessian'].append(hessian_time)
+            history['time_qp'].append(qp_time)
+            history['time_line_search'].append(line_search_time)
+            history['time_total_iter'].append(iter_total_time)
+            
+            if verbose:
+                print(f"    Line search:      {line_search_time:.2f}s")
+                print(f"    ─────────────────────────")
+                print(f"    Total iteration:  {iter_total_time:.2f}s")
+            
+            # Update history
+            history['loss'].append(cost_new.item())
             history['alpha'].append(alpha_accepted)
             
             # Check convergence
             if cost_curr is not None:
-                cost_change = abs(cost_new - cost_curr)
+                cost_change = abs(cost_new.item() - cost_curr.item())
                 history['cost_change'].append(cost_change)
                 
                 if verbose:
-                    if cost_new < cost_curr:
-                        print(f"  ✓ Cost: {cost_new:.6f} (decreased by {cost_curr - cost_new:.6f})")
-                        # Print summary
-                        print(f"Loss: {result['loss'].item():.6f}")
-                        print(f"  Control energy: {w.wControl * result['controlEnergy'].item():.6f}")
-                        print(f"  Control smooth: {w.wControlSmooth * result['controlSmooth'].item():.6f}")
-                        print(f"  Target XY: {w.wTargetXY * result['terminalXYNormSq'].item():.6f}")
-                        print(f"  Target orient: {w.wTargetOrient * result['terminalOrientNormSq'].item():.6f}")
-                        print(f"Terminal error: ||rXY||={result['terminalXYNorm'].item():.6f}, |rTh|={result['terminalThetaAbs'].item():.6f}")
-                        print(f"Final pose: {result['qs'][-1].detach().cpu().numpy()}")
-                        print(f"Goal pose: [{goal[0].item():.4f}, {goal[1].item():.4f}, {goal[2]}]")
-                        print(f"grad norm : {u_new.grad.norm().item()}")
-                        
+                    delta_cost = cost_curr.item() - cost_new.item()
+                    if delta_cost > 0:
+                        print(f"  ✓ Cost: {cost_new.item():.6f} (decreased by {delta_cost:.6f})")
                     else:
-                        print(f"  ⚠ Cost: {cost_new:.6f} (increased by {cost_new - cost_curr:.6f})")
+                        print(f"  ⚠ Cost: {cost_new.item():.6f} (increased by {-delta_cost:.6f})")
+                    
+                    # Print breakdown
+                    print(f"    Control: {w.wControl * result['controlEnergy'].item():.6f}")
+                    print(f"    Target XY: {w.wTargetXY * result['terminalXYNormSq'].item():.6f}")
+                    print(f"    Orient: {w.wTargetOrient * result['terminalOrientNormSq'].item():.6f}")
+                    print(f"    Terminal vel: {w.wObjVel * result['terminalVelEnergy'].item():.6f}")
+                    q_final = result['qs'][-1].detach().cpu().numpy()
+                    goal_np = goal.detach().cpu().numpy()
+                    print(f"  Final pos [x,y,θ]: [{q_final[0]:.4f}, {q_final[1]:.4f}, {q_final[2]:.4f}]")
+                    print(f"  Goal      [x,y,θ]: [{goal_np[0]:.4f}, {goal_np[1]:.4f}, {goal_np[2]:.4f}]")
+                    print(f"  Position error: {result['terminalXYNorm'].item():.4f}m")
+                    print(f"  Orientation error: {result['terminalThetaAbs'].item():.4f}rad")
                 
-                if step_norm < cfg.tol and cost_change < cfg.tol:
+                # Convergence check
+                if grad_norm < cfg.tol:
                     if verbose:
-                        print(f"\n✓ Converged after {iteration+1} iterations!")
+                        print(f"\n✓ Converged! Gradient norm {grad_norm:.6e} < {cfg.tol}")
                     break
             else:
                 history['cost_change'].append(0.0)
                 if verbose:
-                    print(f"  Initial cost: {cost_new:.6f}")
+                    print(f"  Initial cost: {cost_new.item():.6f}")
             
             u_curr = u_new
             cost_curr = cost_new
         
         solve_time = time.time() - start_time
         
-        # Final evaluation with detailed outputs INCLUDING contact data
-        result_final = self.evaluate_cost(u_curr, q0, v0, pusher0, goal, w)
-        
-        loss_final = result_final["loss"]
-        qs_final = result_final["qs"]
-
-        # Final forward simulation WITH contact data collection
-        qs_final_full, vs_final, prs_final, _, contact_forces_final, signed_distances_final = \
+        # --- Final evaluation with contact data ---
+        qs_final, vs_final, prs_final, _, contact_forces_final, signed_distances_final = \
             self.forward_simulate(q0, v0, pusher0, u_curr, store_contact_data=True)
         
-        # Compute initial trajectory for comparison (with contact data)
-        if u_init is None:
-            u_init_eval = self._init_controls_simple(q0, goal)
-        else:
-            u_init_eval = self._to_tensor(u_init)
+        # Compute final gradient
+        _, g_final_torch, _ = self.compute_gauss_newton_hessian(
+            u_curr, q0, v0, pusher0, goal, w,
+            regularization=cfg.hessian_regularization
+        )
+        final_grad_norm = torch.norm(g_final_torch).item()
+        
+        # # Initial trajectory
+        # if u_init is None:
+        #     u_init_eval = self._init_controls_simple(q0, goal)
+        # else:
+        #     u_init_eval = self._to_tensor(u_init)
         qs_init, vs_init, prs_init, _, _, _ = \
             self.forward_simulate(q0, v0, pusher0, u_init_eval, store_contact_data=False)
         
-        # Compute loss components individually for breakdown
+        # Loss components
         controlEnergy = (u_curr ** 2).sum()
         controlSmooth = ((u_curr[1:] - u_curr[:-1]) ** 2).sum() if len(u_curr) > 1 else torch.zeros((), device=self.device)
         terminalVelCost = (vs_final[-1] ** 2).sum()
         rXY = qs_final[-1][:2] - goal[:2]
         terminalXYCost = (rXY ** 2).sum()
-        rTheta = qs_final[-1][2] - goal[2]
-        while rTheta > np.pi:
-            rTheta -= 2 * np.pi
-        while rTheta < -np.pi:
-            rTheta += 2 * np.pi
+        rTheta = wrap_to_pi(qs_final[-1][2] - goal[2])
         terminalOrientCost = rTheta ** 2
         
-        # Extract final gradient (if needed for diagnostics)
-        u_final_ad = u_curr.clone().detach().requires_grad_(True)
-        result_for_grad = self.evaluate_cost(u_final_ad, q0, v0, pusher0, goal, w)
-        loss_for_grad = result_for_grad["loss"]
-        loss_for_grad.backward()
-        final_grad = u_final_ad.grad if u_final_ad.grad is not None else torch.zeros_like(u_curr)
+        loss_final = (
+            w.wControl * controlEnergy +
+            w.wControlSmooth * controlSmooth +
+            w.wObjVel * terminalVelCost +
+            w.wTargetXY * terminalXYCost +
+            w.wTargetOrient * terminalOrientCost
+        )
         
         if verbose:
             print(f"\n{'='*70}")
             print("Optimization Complete!")
             print(f"{'='*70}")
             print(f"Time: {solve_time:.2f}s")
+            print(f"Iterations: {iteration+1}")
             print(f"Final loss: {loss_final.item():.6f}")
-            print(f"Final pose: {qs_final[-1].cpu().numpy()}")
-            print(f"Goal: {goal.cpu().numpy()}")
+            print(f"Final gradient norm: {final_grad_norm:.6e}")
+            print(f"Position error: {torch.norm(rXY).item():.4f}m")
+            print(f"Orientation error: {abs(rTheta.item()):.4f}rad")
+            print(f"{'='*70}")
             
-            pos_error = torch.norm(qs_final[-1][:2] - goal[:2]).item()
-            orient_error = abs(rTheta.item())
-            print(f"Position error: {pos_error:.6f}m")
-            print(f"Orientation error: {orient_error:.6f}rad")
+            # Timing breakdown summary
+            total_hessian = sum(history['time_hessian'])
+            total_qp = sum(history['time_qp'])
+            total_line_search = sum(history['time_line_search'])
+            avg_iter = np.mean(history['time_total_iter'])
+            
+            print(f"\n⏱ Timing Breakdown:")
+            print(f"{'─'*70}")
+            print(f"  Total time:        {solve_time:.2f}s")
+            print(f"  Avg per iteration: {avg_iter:.2f}s")
+            print(f"")
+            print(f"  Cumulative by component:")
+            print(f"    Hessian (build):   {total_hessian:.2f}s  ({100*total_hessian/solve_time:.1f}%)")
+            print(f"    QP solve:          {total_qp:.2f}s  ({100*total_qp/solve_time:.1f}%)")
+            print(f"    Line search:       {total_line_search:.2f}s  ({100*total_line_search/solve_time:.1f}%)")
+            print(f"")
+            print(f"  Average per iteration:")
+            print(f"    Hessian:     {np.mean(history['time_hessian']):.2f}s")
+            print(f"    QP solve:    {np.mean(history['time_qp']):.2f}s")
+            print(f"    Line search: {np.mean(history['time_line_search']):.2f}s")
+            print(f"{'='*70}\n")
         
-        # Return dict matching MS format EXACTLY
+        # Return dict matching original SS SQP format
         return {
-            # Optimized trajectory (matching MS field names)
             "loss": loss_final.detach().cpu(),
             "q_final": qs_final[-1].detach().cpu().numpy(),
             "u_seq": u_curr.detach().cpu().numpy(),
-            "trajectory": qs_final_full.detach().cpu().numpy(),
+            "trajectory": qs_final.detach().cpu().numpy(),
             "velocity_trajectory": vs_final.detach().cpu().numpy(),
             "pusher_trajectory": prs_final.detach().cpu().numpy(),
-            "prKnots": None,  # SS doesn't have knots
-            "contact_forces": contact_forces_final.detach().cpu().numpy(),  # REAL DATA!
-            "signed_distances": signed_distances_final.detach().cpu().numpy(),  # REAL DATA!
+            "prKnots": None,
+            "contact_forces": contact_forces_final.detach().cpu().numpy(),
+            "signed_distances": signed_distances_final.detach().cpu().numpy(),
             
-            # Initial trajectory (for visualization comparison)
             "initial_trajectory": qs_init.cpu().numpy(),
             "initial_velocity_trajectory": vs_init.cpu().numpy(),
             "initial_pusher_trajectory": prs_init.cpu().numpy(),
             
-            # Loss components (matching MS structure)
             "loss_components": {
                 "total": loss_final.item(),
                 "control_energy": controlEnergy.item(),
                 "control_smooth": controlSmooth.item(),
-                "obj_vel": terminalVelCost.item(),  # Terminal velocity (not cumulative)
+                "obj_vel": terminalVelCost.item(),
                 "target_xy": terminalXYCost.item(),
                 "target_orient": terminalOrientCost.item(),
-                # Weights for legend
                 "w_control": w.wControl,
                 "w_smooth": w.wControlSmooth,
                 "w_objvel": w.wObjVel,
@@ -550,23 +763,28 @@ class SingleShootingSQP:
                 "w_orient": w.wTargetOrient,
             },
             
-            # Final control gradient
-            "control_gradients": final_grad.detach().cpu().numpy(),
+            "control_gradients": g_final_torch.detach().cpu().numpy().reshape(self.horizon, 2),
             
-            # History and diagnostics
             "history": {
                 'loss': np.array(history['loss']),
-                'step_norm': np.array(history['step_norm'].detach.cpu().numpy()),
+                'grad_norm': np.array(history['grad_norm']),
+                'step_norm': np.array(history['step_norm']),
                 'cost_change': np.array(history['cost_change']),
                 'alpha': np.array(history['alpha']),
-            },
-            "stationarityInfo": {
-                "final_defect_norm": 0.0,  # SS has no defect (exact forward sim)
-                "final_terminal_error": torch.norm(rXY).item(),
-                "converged": step_norm < cfg.tol if iteration > 0 else False,
+                # Timing data
+                'time_hessian': np.array(history['time_hessian']),
+                'time_qp': np.array(history['time_qp']),
+                'time_line_search': np.array(history['time_line_search']),
+                'time_total_iter': np.array(history['time_total_iter']),
             },
             
-            # Additional SS-specific info
+            "stationarityInfo": {
+                "final_defect_norm": 0.0,
+                "final_grad_norm": final_grad_norm,
+                "final_terminal_error": torch.norm(rXY).item(),
+                "converged": final_grad_norm < cfg.tol,
+            },
+            
             "solve_time": solve_time,
         }
     
@@ -579,22 +797,117 @@ class SingleShootingSQP:
         return x
     
     def _init_controls_simple(self, q0, goal):
-        """
-        Simple constant velocity initialization.
-        Conservative to avoid overshoot.
-        """
-        # Required displacement
+        """Simple constant velocity initialization."""
         displacement = goal[:2] - q0[:2]
         time_horizon = self.horizon * self.dt
-        
-        # Average velocity needed
         avg_velocity = displacement / time_horizon
-        
-        # Safety factor (conservative)
         safety_factor = 0.7
         u_const = avg_velocity * safety_factor
-        
-        # Constant control
         u_init = u_const.unsqueeze(0).repeat(self.horizon, 1)
+        return u_init
+    
+    def compute_geometric_initial_trajectory(
+        self,
+        robot_pos,      # [x, y] - initial robot position
+        box_pos,        # [x, y] or [x, y, theta] - initial box position  
+        goal_pos,       # [x, y] or [x, y, theta] - goal position
+    ):
+        """
+        Create initial trajectory based on geometric path: Robot -> Box -> Goal
+        
+        Uses the optimizer's horizon, dt, and half (box_half_size) automatically.
+        
+        Args:
+            robot_pos: Initial robot position [x, y]
+            box_pos: Initial box position [x, y] or [x, y, theta] (only x, y used)
+            goal_pos: Goal position [x, y] or [x, y, theta] (only x, y used)
+        
+        Returns:
+            u_init: Initial control trajectory as list [[u_x, u_y], ...] (horizon x 2)
+        """
+        
+        # Extract x, y only (handle both [x, y] and [x, y, theta])
+        robot_pos = np.array(robot_pos[:2])
+        box_pos = np.array(box_pos[:2])
+        goal_pos = np.array(goal_pos[:2])
+        
+        # Compute distances
+        dist_robot_to_box = np.linalg.norm(box_pos - robot_pos)
+        dist_box_to_goal = np.linalg.norm(goal_pos - box_pos)
+        total_dist = dist_robot_to_box + dist_box_to_goal
+        
+        print(f"\n[Geometric Init] Distance analysis:")
+        print(f"  Robot -> Box: {dist_robot_to_box:.4f} m")
+        print(f"  Box -> Goal: {dist_box_to_goal:.4f} m")
+        print(f"  Total: {total_dist:.4f} m")
+        
+        # Handle edge case: already at goal
+        if total_dist < 1e-6:
+            print(f"  Already at goal! Using zero controls.")
+            return [[0.0, 0.0]] * self.horizon
+        
+        # Allocate timesteps proportionally to distances
+        min_steps = 5
+        if self.horizon < 2 * min_steps:
+            steps_phase1 = self.horizon // 2
+        else:
+            ratio = dist_robot_to_box / total_dist
+            steps_phase1 = int(self.horizon * ratio)
+            steps_phase1 = max(min_steps, min(self.horizon - min_steps, steps_phase1))
+        
+        steps_phase2 = self.horizon - steps_phase1
+        
+        print(f"  Phase 1 (approach): {steps_phase1} steps")
+        print(f"  Phase 2 (push): {steps_phase2} steps")
+        
+        # Phase 1: Robot approaches box
+        dir_to_box = (box_pos - robot_pos) / (dist_robot_to_box + 1e-8)
+        contact_offset = 0.0001 #self.half  # Slightly more than half size
+        target_contact_pos = box_pos - dir_to_box * contact_offset
+        
+        displacement_phase1 = target_contact_pos - robot_pos
+        time_phase1 = steps_phase1 * self.dt
+        velocity_phase1 = displacement_phase1 / (time_phase1 + 1e-8)
+        
+        print(f"  Phase 1 velocity: [{velocity_phase1[0]:.3f}, {velocity_phase1[1]:.3f}] m/s")
+        
+        # Phase 2: Robot pushes box to goal
+        dir_to_goal = (goal_pos - box_pos) / (dist_box_to_goal + 1e-8)
+        displacement_phase2 = goal_pos - box_pos
+        time_phase2 = steps_phase2 * self.dt
+        velocity_phase2 = displacement_phase2 / (time_phase2 + 1e-8)
+        
+        # Scale down push velocity
+        push_scale = 0.8
+        velocity_phase2 = velocity_phase2 * push_scale
+        
+        print(f"  Phase 2 velocity: [{velocity_phase2[0]:.3f}, {velocity_phase2[1]:.3f}] m/s")
+        
+        # Create control trajectory
+        u_init = []
+        
+        # Phase 1: Approach box
+        for i in range(steps_phase1):
+            u_init.append([float(velocity_phase1[0]), float(velocity_phase1[1])])
+        
+        # Phase 2: Push box to goal
+        for i in range(steps_phase2):
+            u_init.append([float(velocity_phase2[0]), float(velocity_phase2[1])])
+        
+        # Smooth transition (optional)
+        transition_steps = min(5, steps_phase1 // 4, steps_phase2 // 4)
+        if transition_steps > 0:
+            for i in range(transition_steps):
+                alpha = (i + 1) / (transition_steps + 1)
+                idx = steps_phase1 - transition_steps + i
+                if 0 <= idx < steps_phase1:
+                    u_init[idx] = [
+                        float((1 - alpha) * velocity_phase1[0] + alpha * velocity_phase2[0]),
+                        float((1 - alpha) * velocity_phase1[1] + alpha * velocity_phase2[1])
+                    ]
+        
+        print(f"  Generated control trajectory: {len(u_init)} x 2")
+        u_magnitudes = [np.linalg.norm(u) for u in u_init]
+        print(f"  Control magnitude range: [{min(u_magnitudes):.3f}, {max(u_magnitudes):.3f}]")
         
         return u_init
