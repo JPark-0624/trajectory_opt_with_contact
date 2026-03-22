@@ -147,55 +147,36 @@ class BlockMultipleShootingMoreau:
         contactOffset=1e-4
     ):
         """
-        Create piecewise-linear pusher POSITION path, convert to VELOCITY.
+        SIMPLIFIED: Just constant velocity toward goal.
         
-        No physics simulation - pure geometry.
+        No complex path planning - just:
+        v = (goal - box) / time
         
-        Args:
-            pusher0: [2] initial pusher position
-            box0: [2] or [3] initial box position (uses [:2])
-            goal: [2] goal position
-            contactOffset: Stay this far from exact contact
-        
-        Returns:
-            uInit: (T, 2) velocity controls
-            pInit: (T+1, 2) positions (for debugging)
+        This is conservative and won't overshoot.
         """
-        p0 = np.array(pusher0[:2], dtype=float)
         b0 = np.array(box0[:2], dtype=float)
         g0 = np.array(goal[:2], dtype=float)
         
-        distToBox = np.linalg.norm(b0 - p0)
-        distBoxToGoal = np.linalg.norm(g0 - b0)
-        total = distToBox + distBoxToGoal + 1e-9
+        # Required displacement
+        displacement = g0 - b0
+        time_horizon = self.horizon * self.dt
         
-        # Phase 1: Approach box
-        steps1 = max(5, min(self.horizon - 5, int(self.horizon * (distToBox / total))))
-        steps2 = self.horizon - steps1
+        # Average velocity needed
+        avg_velocity = displacement / time_horizon
         
-        dirToBox = (b0 - p0) / (distToBox + 1e-9)
-        pContact = b0 - dirToBox * contactOffset
+        # Scale down by safety factor (conservative)
+        safety_factor = 0.7  # Use only 70% of required velocity
+        u_const = avg_velocity * safety_factor
         
-        # Phase 2: Push to goal
-        dirToGoal = (g0 - b0) / (distBoxToGoal + 1e-9)
-        pFinal = g0 - dirToGoal * contactOffset
+        # Constant control for all timesteps
+        uArr = np.tile(u_const, (self.horizon, 1))
         
-        pList = [p0.copy()]
+        # Dummy position array (not used)
+        pArr = np.zeros((self.horizon + 1, 2))
         
-        # Phase 1: approach
-        for i in range(steps1):
-            a = (i + 1) / steps1
-            p = (1 - a) * p0 + a * pContact
-            pList.append(p)
-        
-        # Phase 2: push
-        for i in range(steps2):
-            a = (i + 1) / steps2
-            p = (1 - a) * pContact + a * pFinal
-            pList.append(p)
-        
-        pArr = np.stack(pList, axis=0)  # (T+1, 2)
-        uArr = (pArr[1:] - pArr[:-1]) / self.dt  # (T, 2)
+        print(f"[Init] Goal displacement: {displacement}")
+        print(f"[Init] Required avg vel: {avg_velocity}")
+        print(f"[Init] Using (70%): {u_const}")
         
         return uArr.astype(np.float32), pArr.astype(np.float32)
     
@@ -394,7 +375,13 @@ class BlockMultipleShootingMoreau:
         # Cost components
         controlEnergy = (u_ad ** 2).sum()
         controlSmooth = ((u_ad[1:] - u_ad[:-1]) ** 2).sum()
-        objVelCost = objVelEnergy
+        
+        # FIXED: Terminal velocity penalty (not cumulative!)
+        # Original bug: objVelCost = objVelEnergy (sum over all timesteps)
+        # Correct: Penalize FINAL velocity to ensure smooth arrival
+        terminalVelocity = vCurr  # Final velocity
+        objVelCost = (terminalVelocity ** 2).sum()
+        
         targetCost = ((qCurr[:2] - goalXY) ** 2).sum()
         
         orientCost = torch.zeros((), device=self.device)
@@ -418,23 +405,30 @@ class BlockMultipleShootingMoreau:
         q = np.concatenate([grad_u, grad_pr])
         
         # ==================================================================
-        # A MATRIX and b VECTOR
+        # A MATRIX and b VECTOR (DELTA FORMULATION)
         # ==================================================================
         constraint_rows = []
         constraint_rhs = []
         
         # Zero cone: Equality constraints
-        # (1) Initial: pr_knots[0] = pr0
+        # (1) Initial: (pr_curr[0] + δpr[0]) = pr0
+        #     → δpr[0] = pr0 - pr_curr[0]
         for d in range(2):
             row = np.zeros(n)
             row[n_u + d] = 1.0
             constraint_rows.append(row)
-            constraint_rhs.append(pr0[d].item())
+            # RHS: pr0 - pr_curr[0]
+            constraint_rhs.append(pr0[d].item() - pr_knots_curr[0, d].item())
         
-        # (2) Continuity: pr_knots[j+1] = pr_knots[j] + Σu*dt
+        # (2) Continuity: (pr_curr[j+1] + δpr[j+1]) = (pr_curr[j] + δpr[j]) + Σ(u_curr + δu)*dt
+        #     → δpr[j+1] - δpr[j] - Σδu*dt = Σu_curr*dt + pr_curr[j] - pr_curr[j+1]
         for j in range(M):
             t0 = j * B
             t1 = min((j + 1) * B, T)
+            
+            # Compute constant term: Σu_curr*dt + pr_curr[j] - pr_curr[j+1]
+            u_sum = u_curr[t0:t1].sum(dim=0) * self.dt
+            const = u_sum + pr_knots_curr[j] - pr_knots_curr[j + 1]
             
             for d in range(2):
                 row = np.zeros(n)
@@ -445,24 +439,32 @@ class BlockMultipleShootingMoreau:
                     row[k * 2 + d] = -self.dt
                 
                 constraint_rows.append(row)
-                constraint_rhs.append(0.0)
+                # RHS: constant term (should be ~0 if u_curr is feasible)
+                constraint_rhs.append(const[d].item())
         
         num_zero_cones = 2 + M * 2
         
         # Nonneg cone: Control limits
+        # (u_curr + δu) must satisfy: u_min ≤ u_curr + δu ≤ u_max
+        # → (u_min - u_curr) ≤ δu ≤ (u_max - u_curr)
         for k in range(T):
             for d in range(2):
                 idx = k * 2 + d
+                u_curr_val = u_curr[k, d].item()
                 
+                # Lower: δu ≥ u_min - u_curr
+                # → -δu + s = -(u_min - u_curr) = u_curr - u_min
                 row_lower = np.zeros(n)
                 row_lower[idx] = -1.0
                 constraint_rows.append(row_lower)
-                constraint_rhs.append(-cfg.u_min)
+                constraint_rhs.append(u_curr_val - cfg.u_min)
                 
+                # Upper: δu ≤ u_max - u_curr
+                # → δu + s = u_max - u_curr
                 row_upper = np.zeros(n)
                 row_upper[idx] = 1.0
                 constraint_rows.append(row_upper)
-                constraint_rhs.append(cfg.u_max)
+                constraint_rhs.append(cfg.u_max - u_curr_val)
         
         num_nonneg_cones = T * 2 * 2
         
@@ -489,7 +491,11 @@ class BlockMultipleShootingMoreau:
         cfg: MoreauConfig,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Solve single QP iteration.
+        Solve single QP iteration for DELTA variables.
+        
+        QP solves for δu, δpr such that:
+        - u_new = u_curr + δu
+        - pr_new = pr_curr + δpr
         
         Returns:
             u_new, pr_knots_new
@@ -498,29 +504,34 @@ class BlockMultipleShootingMoreau:
             u_curr, pr_knots_curr, q0, v0, pr0, goalXY, goalTheta, w, cfg
         )
         
-        # GPU acceleration if available
-        settings = None
+        # Try GPU acceleration if PyTorch device is CUDA
+        solver = None
         if self.device.type == 'cuda':
             try:
                 settings = moreau.Settings(device='cuda')
-            except:
-                # Fallback to CPU if CUDA not available in moreau
-                settings = None
+                solver = moreau.Solver(P, q, A, b, cones=cones, settings=settings)
+            except (RuntimeError, ImportError) as e:
+                # CUDA not available in Moreau, fallback to CPU
+                print(f"  Note: CUDA requested but not available in Moreau, using CPU")
+                print(f"  Install moreau[cuda] for GPU acceleration: pip install moreau[cuda]")
+                solver = None
         
-        # Solve
-        if settings is not None:
-            solver = moreau.Solver(P, q, A, b, cones=cones, settings=settings)
-        else:
+        # Fallback to CPU solver
+        if solver is None:
             solver = moreau.Solver(P, q, A, b, cones=cones)
         
         solution = solver.solve()
         
         n_u = self.horizon * 2
-        u_flat = solution.x[:n_u]
-        pr_flat = solution.x[n_u:]
+        delta_u_flat = solution.x[:n_u]
+        delta_pr_flat = solution.x[n_u:]
         
-        u_new = torch.tensor(u_flat.reshape(self.horizon, 2), device=self.device, dtype=torch.float64)
-        pr_knots_new = torch.tensor(pr_flat.reshape(self.numKnots, 2), device=self.device, dtype=torch.float64)
+        # CRITICAL: QP solves for DELTA, so we ADD to current!
+        delta_u = torch.tensor(delta_u_flat.reshape(self.horizon, 2), device=self.device, dtype=torch.float64)
+        delta_pr = torch.tensor(delta_pr_flat.reshape(self.numKnots, 2), device=self.device, dtype=torch.float64)
+        
+        u_new = u_curr + delta_u
+        pr_knots_new = pr_knots_curr + delta_pr
         
         return u_new, pr_knots_new
     
@@ -596,7 +607,10 @@ class BlockMultipleShootingMoreau:
         # Cost components
         controlEnergy = (u ** 2).sum()
         controlSmooth = ((u[1:] - u[:-1]) ** 2).sum()
-        objVelEnergyCost = objVelEnergy
+        
+        # FIXED: Terminal velocity penalty (not cumulative!)
+        terminalVelocity = vCurr  # Final velocity
+        objVelCost = (terminalVelocity ** 2).sum()
         
         rXY = qCurr[:2] - goalXY
         terminalXYNormSq = (rXY ** 2).sum()
@@ -610,7 +624,7 @@ class BlockMultipleShootingMoreau:
         total_loss = (
             w.wControl * controlEnergy +
             w.wControlSmooth * controlSmooth +
-            w.wObjVel * objVelEnergyCost +
+            w.wObjVel * objVelCost +
             w.wTargetXY * terminalXYNormSq +
             w.wTargetOrient * terminalOrientNormSq
         )
@@ -632,7 +646,7 @@ class BlockMultipleShootingMoreau:
             "loss": total_loss,
             "controlEnergy": controlEnergy,
             "controlSmooth": controlSmooth,
-            "objVelEnergy": objVelEnergyCost,
+            "objVelEnergy": objVelCost,
             "terminalXYNormSq": terminalXYNormSq,
             "terminalOrientNormSq": terminalOrientNormSq,
             "terminalXYNorm": rXY.norm(),
@@ -704,15 +718,60 @@ class BlockMultipleShootingMoreau:
             
             # Solve QP for search direction
             print("Solving QP...")
-            u_new, pr_knots_new = self.solve_qp_step(
+            u_qp, pr_knots_qp = self.solve_qp_step(
                 u_curr, pr_knots_curr, q0, v0, pr0, goalXY, goalTheta, w, cfg
             )
             
-            # Evaluate new iterate
-            print("Evaluating trajectory...")
-            result = self._evaluate_trajectory(
-                u_new, pr_knots_new, q0, v0, goalXY, goalTheta, w
-            )
+            # TRUST REGION: Limit step size on early iterations to avoid wild QP solutions
+            # especially when initial guess overshoots goal
+            if iter < 3:  # First 3 iterations
+                max_step = 0.5  # Max 50% change per iteration
+                delta_u = u_qp - u_curr
+                delta_u_norm = torch.norm(delta_u)
+                if delta_u_norm > max_step:
+                    print(f"  Trust region: scaling step from {delta_u_norm:.3f} to {max_step:.3f}")
+                    u_qp = u_curr + (delta_u / delta_u_norm) * max_step
+            
+            # Line search (if enabled)
+            if cfg.use_line_search and cost_curr is not None:
+                print("Line search...")
+                alpha = 1.0
+                for ls_iter in range(cfg.line_search_max_iters):
+                    # Try step
+                    u_trial = u_curr + alpha * (u_qp - u_curr)
+                    pr_trial = pr_knots_curr + alpha * (pr_knots_qp - pr_knots_curr)
+                    
+                    # Evaluate
+                    result_trial = self._evaluate_trajectory(
+                        u_trial, pr_trial, q0, v0, goalXY, goalTheta, w
+                    )
+                    cost_trial = result_trial["loss"].item()
+                    
+                    # Armijo condition: f(x + α*d) <= f(x) + c1*α*g'*d
+                    # Simplified: just check if cost decreased
+                    if cost_trial < cost_curr + cfg.line_search_c1 * alpha * (cost_trial - cost_curr):
+                        print(f"  Line search accepted α={alpha:.4f}, cost={cost_trial:.6f}")
+                        u_new = u_trial
+                        pr_knots_new = pr_trial
+                        result = result_trial
+                        break
+                    else:
+                        alpha *= cfg.line_search_beta
+                        if ls_iter == cfg.line_search_max_iters - 1:
+                            print(f"  Line search failed, using α={alpha:.4f}")
+                            u_new = u_trial
+                            pr_knots_new = pr_trial
+                            result = result_trial
+            else:
+                # No line search, use full step
+                u_new = u_qp
+                pr_knots_new = pr_knots_qp
+                
+                # Evaluate new iterate
+                print("Evaluating trajectory...")
+                result = self._evaluate_trajectory(
+                    u_new, pr_knots_new, q0, v0, goalXY, goalTheta, w
+                )
             
             cost_new = result["loss"].item()
             

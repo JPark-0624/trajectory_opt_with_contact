@@ -44,6 +44,12 @@ class SQPConfig:
     # Gauss-Newton Hessian
     use_gauss_newton: bool = True
     hessian_regularization: float = 1e-6
+    
+    # IPM target_mu scheduling
+    use_mu_scheduling: bool = False  # Enable scheduling
+    mu_schedule_type: str = 'exponential'  # 'linear', 'exponential', 'stepwise', 'adaptive'
+    mu_start: float = 1e-2  # Initial (loose)
+    mu_end: float = 1e-5    # Final (tight)
 
 
 @dataclass
@@ -501,15 +507,37 @@ class SingleShootingSQPGaussNewton:
             'time_qp': [],
             'time_line_search': [],
             'time_total_iter': [],
+            # IPM target_mu tracking
+            'target_mu': [],
         }
+        
+        # Track previous gradient norm for adaptive scheduling
+        grad_norm_prev = None
         
         # SQP loop
         for iteration in range(cfg.maxIters):
             iter_start_time = time.time()
             
+            # --- Apply target_mu scheduling ---
+            if cfg.use_mu_scheduling:
+                target_mu = self._schedule_target_mu(
+                    iteration, cfg, 
+                    grad_norm=history['grad_norm'][-1] if iteration > 0 else None,
+                    grad_norm_prev=grad_norm_prev
+                )
+                # Update IPM options for this iteration
+                self.ipmOpts.target_mu = target_mu
+                history['target_mu'].append(target_mu)
+                
+                if verbose and iteration == 0:
+                    print(f"\n📊 Target_mu scheduling: {cfg.mu_schedule_type}")
+                    print(f"   Start: {cfg.mu_start:.1e} → End: {cfg.mu_end:.1e}")
+            
             if verbose:
                 print(f"\n{'='*70}")
                 print(f"SQP Iteration {iteration+1}/{cfg.maxIters}")
+                if cfg.use_mu_scheduling:
+                    print(f"  IPM target_mu: {self.ipmOpts.target_mu:.2e}")
                 print(f"{'='*70}")
             
             # --- STEP 1: Build and solve QP ---
@@ -641,6 +669,8 @@ class SingleShootingSQPGaussNewton:
                     print(f"    Target XY: {w.wTargetXY * result['terminalXYNormSq'].item():.6f}")
                     print(f"    Orient: {w.wTargetOrient * result['terminalOrientNormSq'].item():.6f}")
                     print(f"    Terminal vel: {w.wObjVel * result['terminalVelEnergy'].item():.6f}")
+                    
+                    # Final position vs goal
                     q_final = result['qs'][-1].detach().cpu().numpy()
                     goal_np = goal.detach().cpu().numpy()
                     print(f"  Final pos [x,y,θ]: [{q_final[0]:.4f}, {q_final[1]:.4f}, {q_final[2]:.4f}]")
@@ -660,6 +690,9 @@ class SingleShootingSQPGaussNewton:
             
             u_curr = u_new
             cost_curr = cost_new
+            
+            # Update grad_norm_prev for adaptive scheduling
+            grad_norm_prev = grad_norm
         
         solve_time = time.time() - start_time
         
@@ -668,7 +701,7 @@ class SingleShootingSQPGaussNewton:
             self.forward_simulate(q0, v0, pusher0, u_curr, store_contact_data=True)
         
         # Compute final gradient
-        _, g_final_torch, _ = self.compute_gauss_newton_hessian(
+        _, g_final_torch, _= self.compute_gauss_newton_hessian(
             u_curr, q0, v0, pusher0, goal, w,
             regularization=cfg.hessian_regularization
         )
@@ -731,6 +764,15 @@ class SingleShootingSQPGaussNewton:
             print(f"    Hessian:     {np.mean(history['time_hessian']):.2f}s")
             print(f"    QP solve:    {np.mean(history['time_qp']):.2f}s")
             print(f"    Line search: {np.mean(history['time_line_search']):.2f}s")
+            
+            # Target_mu schedule summary
+            if cfg.use_mu_scheduling and len(history['target_mu']) > 0:
+                print(f"\n📊 Target_mu Schedule ({cfg.mu_schedule_type}):")
+                print(f"{'─'*70}")
+                print(f"  Initial:    {history['target_mu'][0]:.2e}")
+                print(f"  Final:      {history['target_mu'][-1]:.2e}")
+                print(f"  Reduction:  {history['target_mu'][0]/history['target_mu'][-1]:.1f}×")
+            
             print(f"{'='*70}\n")
         
         # Return dict matching original SS SQP format
@@ -776,6 +818,8 @@ class SingleShootingSQPGaussNewton:
                 'time_qp': np.array(history['time_qp']),
                 'time_line_search': np.array(history['time_line_search']),
                 'time_total_iter': np.array(history['time_total_iter']),
+                # IPM scheduling
+                'target_mu': np.array(history['target_mu']) if history['target_mu'] else np.array([self.ipmOpts.target_mu] * len(history['loss'])),
             },
             
             "stationarityInfo": {
@@ -805,6 +849,71 @@ class SingleShootingSQPGaussNewton:
         u_const = avg_velocity * safety_factor
         u_init = u_const.unsqueeze(0).repeat(self.horizon, 1)
         return u_init
+    
+    def _schedule_target_mu(self, iteration: int, cfg: SQPConfig, grad_norm: float = None, grad_norm_prev: float = None) -> float:
+        """
+        Compute target_mu for IPM based on iteration number.
+        
+        Continuation method: Start with loose complementarity, gradually tighten.
+        
+        Args:
+            iteration: Current iteration (0-indexed)
+            cfg: SQP configuration
+            grad_norm: Current gradient norm (for adaptive scheduling)
+            grad_norm_prev: Previous gradient norm (for adaptive scheduling)
+        
+        Returns:
+            target_mu: Target complementarity tolerance
+        """
+        if not cfg.use_mu_scheduling:
+            # Use default from IPM options
+            return self.ipmOpts.target_mu
+        
+        max_iter = cfg.maxIters
+        t = iteration / max(max_iter - 1, 1)  # Normalized time [0, 1]
+        
+        if cfg.mu_schedule_type == 'linear':
+            # Linear interpolation
+            mu = cfg.mu_start * (1 - t) + cfg.mu_end * t
+            
+        elif cfg.mu_schedule_type == 'exponential':
+            # Exponential decay (recommended)
+            mu = cfg.mu_start * (cfg.mu_end / cfg.mu_start) ** t
+            
+        elif cfg.mu_schedule_type == 'stepwise':
+            # Step-wise schedule
+            if iteration < 5:
+                mu = cfg.mu_start
+            elif iteration < 15:
+                mu = cfg.mu_start / 10
+            elif iteration < 25:
+                mu = cfg.mu_start / 100
+            else:
+                mu = cfg.mu_end
+                
+        elif cfg.mu_schedule_type == 'adaptive':
+            # Adaptive based on convergence rate
+            if iteration == 0:
+                mu = cfg.mu_start
+            elif grad_norm is not None and grad_norm_prev is not None:
+                # Current mu (stored in instance variable)
+                mu_current = getattr(self, '_current_mu', cfg.mu_start)
+                
+                # If gradient decreased significantly, tighten mu
+                if grad_norm < 0.1 * grad_norm_prev:
+                    mu = max(mu_current / 10, cfg.mu_end)
+                else:
+                    mu = mu_current
+                    
+                # Store for next iteration
+                self._current_mu = mu
+            else:
+                mu = getattr(self, '_current_mu', cfg.mu_start)
+        else:
+            raise ValueError(f"Unknown mu_schedule_type: {cfg.mu_schedule_type}")
+        
+        return float(mu)
+    
     
     def compute_geometric_initial_trajectory(
         self,
