@@ -43,7 +43,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
 ipmOpts = IPMOptions(
-    target_mu=1e-6,           # Tight complementarity
+    target_mu=1e-4,           # Tight complementarity
     max_newton=20,
     tol=1e-6,
     enable_viscous_ground_friction=True,
@@ -67,8 +67,8 @@ optimizer = SingleShootingSQPGaussNewton(
 # Diagonal push
 q0 = [0.0, 0.0, 0.0]
 v0 = [0.0, 0.0, 0.0]
-pusher0 = [-0.1, -0.3]
-goal = [0.2, 0.5, -0.3]
+pusher0 = [-0.2, 0.0]
+goal = [0.5, 0.2, 0.3]
 
 # Or X-axis push:
 # q0 = [0.0, 0.0, 0.0]
@@ -81,7 +81,7 @@ print(f"Goal pose: {goal}")
 
 # SQP configuration with Gauss-Newton
 cfg = SQPConfig(
-    maxIters=30,
+    maxIters=50,
     tol=1e-4,
     use_gauss_newton=True,  # ⭐ Enable Gauss-Newton Hessian (P = J^T J)
     hessian_regularization=1e-6,  # Regularization λ for P + λI
@@ -97,6 +97,7 @@ cfg = SQPConfig(
     mu_schedule_type='stepwise',
     mu_start=1e-3,
     mu_end=1e-6,
+    u_init_mode='zero'
 )
 
 # Cost weights (matching visualize_example: w_target=20, w_orient=0.5, w_v=1.0, w_ctrl=0.01)

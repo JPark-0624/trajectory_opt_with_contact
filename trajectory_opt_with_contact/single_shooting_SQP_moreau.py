@@ -9,6 +9,7 @@ import torch
 import numpy as np
 from scipy import sparse
 import moreau
+import moreau.torch as moreau_torch
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 from trajectory_opt_with_contact.dynamics import IPMOptions
@@ -24,13 +25,15 @@ def wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
 class SQPConfig:
     """SQP optimizer configuration"""
     maxIters: int = 20
-    tol: float = 1e-4
+    tol: float = 1e-4        # gradient norm convergence
+    cost_tol: float = 1e-6   # cost change convergence
     
     # Line search
     use_line_search: bool = True
     line_search_max_iters: int = 10
     line_search_beta: float = 0.5
     line_search_c1: float = 1e-4
+    line_search_ftol: float = 1e-8  # accept if cost_trial <= cost_curr + ftol
     
     # Control bounds
     u_min: float = -0.3
@@ -44,6 +47,9 @@ class SQPConfig:
     # Gauss-Newton Hessian
     use_gauss_newton: bool = True
     hessian_regularization: float = 1e-6
+
+    # Initial guess ('geometric' or 'zero')
+    u_init_mode: str = 'geometric'
     
     # IPM target_mu scheduling
     use_mu_scheduling: bool = False  # Enable scheduling
@@ -54,12 +60,15 @@ class SQPConfig:
 
 @dataclass
 class CostWeights:
-    """Cost function weights"""
-    wControl: float = 0.1
-    wControlSmooth: float = 0.0
-    wObjVel: float = 1.0  # Terminal velocity
-    wTargetXY: float = 20.0
-    wTargetOrient: float = 0.5
+    """Cost function weights.
+    Fields accept float or torch.Tensor (scalar).
+    Pass torch.Tensor with requires_grad=True to enable gradient flow w -> u*(w).
+    """
+    wControl: object = 0.1
+    wControlSmooth: object = 0.0
+    wObjVel: object = 1.0  # Terminal velocity
+    wTargetXY: object = 20.0
+    wTargetOrient: object = 0.5
 
 
 class SingleShootingSQPGaussNewton:
@@ -97,7 +106,59 @@ class SingleShootingSQPGaussNewton:
         self.ipmOpts = ipmOpts if ipmOpts is not None else IPMOptions()
         self.dynamics = dynamics_module
         self.Izz = (1.0/6.0) * mass * (side_length**2 + side_length**2)
+
+        # Pre-build moreau.torch.Solver with fixed sparsity structure.
+        # A (box constraints) structure is fixed for all iterations.
+        # P (Gauss-Newton Hessian) is dense n x n — structure also fixed, only values change.
+        self._init_moreau_torch_solver(device)
     
+    def _init_moreau_torch_solver(self, device: str):
+        """
+        Pre-build moreau.torch.Solver with fixed sparsity structure.
+
+        P: dense n x n (full symmetric) — structure fixed, values updated each iter.
+        A: box constraints — structure fixed, values updated each iter (u_curr changes).
+
+        moreau.torch.Solver requires CSR sparsity indices at construction time,
+        so we register them once here.
+        """
+        T = self.horizon
+        n = T * 2        # primal vars
+        m = T * 2 * 2    # constraints (lower + upper per control dim)
+
+        # --- P sparsity: dense n x n, full symmetric (both triangles required) ---
+        # Row i has entries at columns 0..n-1
+        P_row_offsets = torch.arange(0, (n + 1) * n, n, dtype=torch.int32)  # [0, n, 2n, ...]
+        P_col_indices = torch.arange(n, dtype=torch.int32).repeat(n)         # [0,1,...,n-1, 0,1,...] x n
+
+        # --- A sparsity: box constraints, one nonzero per row ---
+        # Lower bound row t*4+d*2+0: -delta_u[t,d]  → col = t*2+d, val = -1
+        # Upper bound row t*4+d*2+1: +delta_u[t,d]  → col = t*2+d, val = +1
+        A_row_offsets = torch.arange(0, m + 1, dtype=torch.int32)  # one nnz per row
+        A_col_indices = torch.zeros(m, dtype=torch.int32)
+        for t in range(T):
+            for d in range(2):
+                idx = t * 2 + d
+                A_col_indices[idx * 2 + 0] = idx  # lower bound row
+                A_col_indices[idx * 2 + 1] = idx  # upper bound row
+
+        cones = moreau.Cones(num_zero_cones=0, num_nonneg_cones=m)
+
+        moreau_device = 'cuda' if torch.device(device).type == 'cuda' and moreau.device_available('cuda') else 'cpu'
+        settings = moreau.Settings(device=moreau_device)
+
+        self._moreau_torch_solver = moreau_torch.Solver(
+            n=n, m=m,
+            P_row_offsets=P_row_offsets,
+            P_col_indices=P_col_indices,
+            A_row_offsets=A_row_offsets,
+            A_col_indices=A_col_indices,
+            cones=cones,
+            settings=settings,
+        )
+        self._moreau_n = n
+        self._moreau_m = m
+
     def forward_simulate(
         self,
         q0: torch.Tensor,
@@ -184,23 +245,29 @@ class SingleShootingSQPGaussNewton:
         qFinal = qs[-1]
         vFinal = vs[-1]
         
+        def _as_tensor(w_val):
+            """Convert weight (float or Tensor) to scalar tensor, preserving grad."""
+            if isinstance(w_val, torch.Tensor):
+                return w_val.to(dtype=u.dtype, device=self.device)
+            return torch.tensor(w_val, dtype=u.dtype, device=self.device)
+
         # --- Control residuals ---
-        # r_control = √wControl · u
-        r_control = torch.sqrt(torch.tensor(w.wControl, device=self.device)) * u.flatten()
+        # r_control = sqrt(wControl) * u
+        r_control = torch.sqrt(_as_tensor(w.wControl)) * u.flatten()
         
         # --- Target XY residuals ---
-        # r_target = √wTarget · (q_final[:2] - goal[:2])
+        # r_target = sqrt(wTargetXY) * (q_final[:2] - goal[:2])
         rXY = qFinal[:2] - goal[:2]
-        r_target = torch.sqrt(torch.tensor(w.wTargetXY, device=self.device)) * rXY
+        r_target = torch.sqrt(_as_tensor(w.wTargetXY)) * rXY
         
         # --- Orientation residual ---
-        # r_orient = √wOrient · wrap(q_final[2] - goal[2])
+        # r_orient = sqrt(wTargetOrient) * wrap(q_final[2] - goal[2])
         rTheta = wrap_to_pi(qFinal[2] - goal[2])
-        r_orient = torch.sqrt(torch.tensor(w.wTargetOrient, device=self.device)) * rTheta.unsqueeze(0)
+        r_orient = torch.sqrt(_as_tensor(w.wTargetOrient)) * rTheta.unsqueeze(0)
         
         # --- Terminal velocity residuals ---
-        # r_vel = √wVel · v_final
-        r_vel = torch.sqrt(torch.tensor(w.wObjVel, device=self.device)) * vFinal
+        # r_vel = sqrt(wObjVel) * v_final
+        r_vel = torch.sqrt(_as_tensor(w.wObjVel)) * vFinal
         
         # Concatenate all residuals
         r = torch.cat([r_control, r_target, r_orient, r_vel])
@@ -255,7 +322,7 @@ class SingleShootingSQPGaussNewton:
         
         # Gradient: g = J^T r
         t0 = time.time()
-        g = J.T @ r.detach()
+        g = J.T @ r
         if self.device.type == 'cuda':
             torch.cuda.synchronize()  # ⭐ Wait for GPU completion
         timing['gradient_assembly'] = time.time() - t0
@@ -342,44 +409,37 @@ class SingleShootingSQPGaussNewton:
         
         # --- CONSTRAINTS (box constraints on delta) ---
         t0 = time.time()
-        # u_min ≤ u_curr + δu ≤ u_max
-        # Reformulate as: A δu + s = b, s ≥ 0
-        
-        constraint_rows = []
-        constraint_rhs = []
-        
-        u_curr_np = u_curr.cpu().numpy().flatten()
-        
-        for t in range(T):
-            for d in range(2):
-                idx = t * 2 + d
-                u_curr_val = u_curr_np[idx]
-                
-                # Lower: -δu + s = u_curr - u_min
-                row_lower = np.zeros(n)
-                row_lower[idx] = -1.0
-                constraint_rows.append(row_lower)
-                constraint_rhs.append(u_curr_val - cfg.u_min)
-                
-                # Upper: δu + s = u_max - u_curr
-                row_upper = np.zeros(n)
-                row_upper[idx] = 1.0
-                constraint_rows.append(row_upper)
-                constraint_rhs.append(cfg.u_max - u_curr_val)
-        
-        A = sparse.csr_array(np.vstack(constraint_rows))
-        b = np.array(constraint_rhs)
-        
-        cones = moreau.Cones(
-            num_zero_cones=0,
-            num_nonneg_cones=T * 2 * 2,
-        )
-        
-        # Convert P to sparse (Moreau expects sparse)
-        P_sparse = sparse.csr_matrix(P_np)
+        # u_min <= u_curr + delta_u <= u_max
+        # Lower: -delta_u[i] + s = u_curr[i] - u_min  (s >= 0)
+        # Upper: +delta_u[i] + s = u_max - u_curr[i]  (s >= 0)
+        # A has one nnz per row. For each control dim i:
+        #   row 2i+0 (lower): A[2i,   i] = -1
+        #   row 2i+1 (upper): A[2i+1, i] = +1
+        # So A_values = [-1, +1, -1, +1, ...] of length m = n*2
+        u_curr_flat = u_curr.detach().flatten()
+        A_values = torch.tensor([-1.0, 1.0], dtype=torch.float64, device=self.device).repeat(n)
+        b_lower = u_curr_flat - cfg.u_min
+        b_upper = cfg.u_max - u_curr_flat
+        b_vec = torch.stack([b_lower, b_upper], dim=1).flatten()  # interleave: [lo0,hi0,lo1,hi1,...]
+
         timing['constraint_assembly'] = time.time() - t0
-        
-        return P_sparse, g_np, A, b, cones, timing
+
+        # --- SOLVE QP with moreau.torch (gradient-enabled) ---
+        t0 = time.time()
+        # P_values: flatten row-major for dense symmetric matrix
+        if cfg.use_gauss_newton:
+            P_values = P_torch.flatten()  # shape (n*n,), full symmetric
+        else:
+            P_values = torch.eye(n, dtype=torch.float64, device=self.device).flatten()
+        g_vec = g_torch  # shape (n,), torch.Tensor with grad
+
+        self._moreau_torch_solver.setup(P_values, A_values)
+        solution = self._moreau_torch_solver.solve(g_vec, b_vec)
+        timing['qp_solve'] = time.time() - t0
+
+        delta_u = solution.x.reshape(self.horizon, 2)  # gradient flows through g_vec -> w
+
+        return delta_u, g_vec, timing
     
     def evaluate_cost(
         self,
@@ -460,13 +520,15 @@ class SingleShootingSQPGaussNewton:
         
         # Initialize controls
         if u_init is None:
-            # u_curr = self._init_controls_simple(q0, goal)
-            u_curr_np = self.compute_geometric_initial_trajectory(
-                robot_pos=pusher0.detach().cpu().numpy(),
-                box_pos = q0.detach().cpu().numpy(),
-                goal_pos=goal.detach().cpu().numpy()
+            if cfg.u_init_mode == 'zero':
+                u_curr = torch.zeros(self.horizon, 2, dtype=torch.float64, device=self.device)
+            else:  # 'geometric'
+                u_curr_np = self.compute_geometric_initial_trajectory(
+                    robot_pos=pusher0.detach().cpu().numpy(),
+                    box_pos=q0.detach().cpu().numpy(),
+                    goal_pos=goal.detach().cpu().numpy()
                 )
-            u_curr = self._to_tensor(u_curr_np)
+                u_curr = self._to_tensor(u_curr_np)
             u_init_eval = u_curr
         else:
             u_curr = self._to_tensor(u_init)
@@ -542,35 +604,18 @@ class SingleShootingSQPGaussNewton:
             
             # --- STEP 1: Build and solve QP ---
             hessian_start = time.time()
-            P, q, A, b, cones, qp_timing = self.build_qp_matrices(
+            delta_u, g_vec, qp_timing = self.build_qp_matrices(
                 u_curr, q0, v0, pusher0, goal, w, cfg
             )
             hessian_time = time.time() - hessian_start
-            
-            # Solve using Moreau conic solver with GPU acceleration
-            qp_start = time.time()
-            
-            # Configure Moreau to use GPU if available
-            moreau_device = 'cuda' if self.device.type == 'cuda' and moreau.device_available('cuda') else 'cpu'
-            moreau_settings = moreau.Settings(device=moreau_device)
-            
-            solver = moreau.Solver(P, q, A, b, cones=cones, settings=moreau_settings)
-            solution = solver.solve()
-            
+
             # Sync GPU if needed
             if self.device.type == 'cuda':
                 torch.cuda.synchronize()
-            qp_time = time.time() - qp_start
-            
-            # Extract delta
-            delta_u = torch.tensor(
-                solution.x.reshape(self.horizon, 2),
-                device=self.device,
-                dtype=torch.float64
-            )
-            
-            # Gradient norm (from q vector)
-            grad_norm = np.linalg.norm(q)
+            qp_time = qp_timing.get('qp_solve', 0.0)
+
+            # Gradient norm
+            grad_norm = g_vec.detach().norm().item()
             history['grad_norm'].append(grad_norm)
             
             if verbose:
@@ -582,8 +627,6 @@ class SingleShootingSQPGaussNewton:
                 else:
                     print()
                 print(f"    QP solve:         {qp_time:.2f}s")
-            
-            # Trust region (early iterations)
             if cfg.use_trust_region and iteration < cfg.trust_region_iters:
                 delta_norm = torch.norm(delta_u).item()
                 if delta_norm > cfg.trust_region_size:
@@ -609,8 +652,8 @@ class SingleShootingSQPGaussNewton:
                     result = self.evaluate_cost(u_trial, q0, v0, pusher0, goal, w)
                     cost_trial = result["loss"]
                     
-                    # Armijo condition
-                    if cost_trial < cost_curr:
+                    # Armijo condition with tolerance (accept near-flat landscape)
+                    if cost_trial <= cost_curr + cfg.line_search_ftol:
                         if verbose:
                             print(f"  Line search: α={alpha:.4f}, cost={cost_trial.item():.6f} (accepted)")
                         u_new = u_trial
@@ -682,6 +725,10 @@ class SingleShootingSQPGaussNewton:
                 if grad_norm < cfg.tol:
                     if verbose:
                         print(f"\n✓ Converged! Gradient norm {grad_norm:.6e} < {cfg.tol}")
+                    break
+                if cost_change < cfg.cost_tol:
+                    if verbose:
+                        print(f"\n✓ Converged! Cost change {cost_change:.2e} < {cfg.cost_tol}")
                     break
             else:
                 history['cost_change'].append(0.0)
