@@ -57,6 +57,8 @@ class SQPConfig:
     mu_start: float = 1e-2  # Initial (loose)
     mu_end: float = 1e-5    # Final (tight)
 
+    verbose: bool = False
+
 
 @dataclass
 class CostWeights:
@@ -339,7 +341,8 @@ class SingleShootingSQPGaussNewton:
             torch.cuda.synchronize()  # ⭐ Wait for GPU completion
         timing['hessian_assembly'] = time.time() - t0
         
-        return P, g, timing
+        # Return J_r and r for IFT (IRL outer loop)
+        return P, g, timing, J.detach(), r.detach()
     
     def build_qp_matrices(
         self,
@@ -368,7 +371,7 @@ class SingleShootingSQPGaussNewton:
         # --- COMPUTE HESSIAN AND GRADIENT ---
         if cfg.use_gauss_newton:
             # Gauss-Newton: P = J^T J
-            P_torch, g_torch, hess_timing = self.compute_gauss_newton_hessian(
+            P_torch, g_torch, hess_timing, _, _ = self.compute_gauss_newton_hessian(
                 u_curr, q0, v0, pusher0, goal, w,
                 regularization=cfg.hessian_regularization
             )
@@ -747,11 +750,13 @@ class SingleShootingSQPGaussNewton:
         qs_final, vs_final, prs_final, _, contact_forces_final, signed_distances_final = \
             self.forward_simulate(q0, v0, pusher0, u_curr, store_contact_data=True)
         
-        # Compute final gradient
-        _, g_final_torch, _= self.compute_gauss_newton_hessian(
+        # Compute final gradient + J_r, r for IFT
+        _, g_final_torch, _, J_r_final, r_final = self.compute_gauss_newton_hessian(
             u_curr, q0, v0, pusher0, goal, w,
             regularization=cfg.hessian_regularization
         )
+        # Recompute P cleanly (without regularization) for IFT — caller can add reg if needed
+        P_final = J_r_final.T @ J_r_final
         final_grad_norm = torch.norm(g_final_torch).item()
         
         # # Initial trajectory
@@ -853,6 +858,14 @@ class SingleShootingSQPGaussNewton:
             },
             
             "control_gradients": g_final_torch.detach().cpu().numpy().reshape(self.horizon, 2),
+            
+            # IFT data: P = J_r^T J_r, J_r = ∂r/∂u, r = residuals at u*
+            # Used by IRL outer loop to compute ∂u*/∂w via IFT
+            "ift_data": {
+                "P": P_final.detach(),        # (n, n)  Gauss-Newton Hessian (no reg)
+                "J_r": J_r_final.detach(),    # (n_res, n)  residual Jacobian
+                "r": r_final.detach(),        # (n_res,)    residuals at u*
+            },
             
             "history": {
                 'loss': np.array(history['loss']),
