@@ -1,25 +1,77 @@
 """
-Example: IRL Feature Matching Test
+Example: IRL — KKT Residual + Control Matching EG
 
-Step 1. SQP SS로 known w_true로 demo trajectory 생성
-Step 2. IRLSolver.fit_feature_matching() 실행
-Step 3. w_recovered vs w_true 비교
+두 방법을 순서대로 실행하고 결과를 비교한다.
+  1. fit_weights_kkt_residual  : single QP, inner loop 없음 (빠름, warm-start용)
+  2. fit_control_matching_eg   : bilevel IRL, EG outer + SQP inner
 
-목적: inner solver 없이 outer loop (weight optimization) 구조가
-       올바르게 작동하는지 검증.
+Usage:
+    # 1. 데이터셋 생성 (최초 1회)
+    python generate_irl_dataset.py --out_dir ./data/irl
+
+    # 2. IRL 실행
+    python example_irl_sqp.py --data_dir ./data/irl
 """
 
 import torch
 import numpy as np
-import sys, os
+import argparse, json, sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trajectory_opt_with_contact.single_shooting_SQP_moreau import (
-    SingleShootingSQPGaussNewton, SQPConfig, CostWeights
+    SingleShootingSQPGaussNewton, CostWeights
 )
 from trajectory_opt_with_contact.dynamics import step_square_pos_ip, IPMOptions
-from trajectory_opt_with_contact.irl_sqp import IRLSolver, IRLConfig, pack_demo
+from trajectory_opt_with_contact.irl_sqp import IRLSolver, IRLConfig
+from trajectory_opt_with_contact.utils import load_demo_npz
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--data_dir',    type=str,   default='./data/irl')
+parser.add_argument('--outer_iters', type=int,   default=50)
+parser.add_argument('--inner_iters', type=int,   default=200)
+parser.add_argument('--lr',          type=float, default=0.1)
+parser.add_argument('--weight_tol',  type=float, default=1e-6)
+parser.add_argument('--skip_eg',     action='store_true',
+                    help='KKT residual only (skip bilevel EG)')
+args = parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Load dataset
+# ---------------------------------------------------------------------------
+
+meta_path = os.path.join(args.data_dir, 'metadata.json')
+assert os.path.exists(meta_path), \
+    f"Dataset not found at {meta_path}. Run generate_irl_dataset.py first."
+
+with open(meta_path) as f:
+    metadata = json.load(f)
+
+w_true = np.array(metadata['w_true_norm'])
+wnames = metadata['weight_names']
+phys   = metadata['physics']
+
+print(f"\n{'='*60}")
+print(f"IRL Example")
+print(f"{'='*60}")
+print(f"w_true: {dict(zip(wnames, w_true.round(4)))}")
+
+# Load all converged demos
+all_demos = []
+for d in metadata['demos']:
+    p = os.path.join(args.data_dir, f"{d['name']}.npz")
+    if d['inner_converged']:
+        all_demos.append(load_demo_npz(p))
+        print(f"  + {d['name']:20s} proj_grad={d['final_proj_grad_norm']:.2e}")
+    else:
+        print(f"  - {d['name']:20s} skipped (not converged)")
+
+assert len(all_demos) > 0, "No converged demos found."
+print(f"Using {len(all_demos)}/{len(metadata['demos'])} demos")
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -28,201 +80,179 @@ from trajectory_opt_with_contact.irl_sqp import IRLSolver, IRLConfig, pack_demo
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-MASS        = 1.0
-SIDE        = 0.2
-MU          = 0.5
-HORIZON     = 30
-DT          = 0.05
-
+ipm_cfg  = metadata['ipm_opts']
 ipm_opts = IPMOptions(
-    target_mu=1e-4, max_newton=20, tol=1e-6,
-    enable_viscous_ground_friction=True,
-    smooth_sdf=50.0, c_lin=1.0, c_ang=0.00667
+    target_mu  = ipm_cfg['target_mu'],
+    max_newton = ipm_cfg['max_newton'],
+    tol        = ipm_cfg['tol'],
+    enable_viscous_ground_friction = ipm_cfg['enable_viscous_ground_friction'],
+    smooth_sdf = ipm_cfg['smooth_sdf'],
+    c_lin      = ipm_cfg['c_lin'],
+    c_ang      = ipm_cfg['c_ang'],
 )
 
 sqp_solver = SingleShootingSQPGaussNewton(
-    mass=MASS, side_length=SIDE, mu=MU,
-    horizon=HORIZON, dt=DT, device=device,
-    dynamics_module=step_square_pos_ip,
-    ipmOpts=ipm_opts,
+    mass=phys['mass'], side_length=phys['side'], mu=phys['mu'],
+    horizon=phys['horizon'], dt=phys['dt'], device=device,
+    dynamics_module=step_square_pos_ip, ipmOpts=ipm_opts,
 )
-
-# ---------------------------------------------------------------------------
-# Step 1: Generate demo with known weights
-# ---------------------------------------------------------------------------
-
-q0      = [0.0, 0.0, 0.0]
-v0      = [0.0, 0.0, 0.0]
-pusher0 = [-0.2, 0.0]
-goal = [0.5, 0.2, 0.3]
-
-# True weights (normalized internally by IRL, but we set absolute scale here)
-w_true = CostWeights(
-    wTargetXY    = 20.0,
-    wTargetOrient = 1.0,
-    wObjVel      = 1.0,
-    wControl     = 0.01,
-)
-
-print("\n" + "="*60)
-print("Step 1: Generating demo trajectory")
-print("="*60)
-print(f"True weights:")
-print(f"  wTargetXY   : {w_true.wTargetXY}")
-print(f"  wTargetOrient: {w_true.wTargetOrient}")
-print(f"  wObjVel     : {w_true.wObjVel}")
-print(f"  wControl    : {w_true.wControl}")
-
-cfg_demo = SQPConfig(
-    maxIters=50,
-    tol=1e-4,
-    use_gauss_newton=True,  # ⭐ Enable Gauss-Newton Hessian (P = J^T J)
-    hessian_regularization=1e-6,  # Regularization λ for P + λI
-    use_line_search=True,
-    line_search_max_iters=10,
-    line_search_beta=0.5,
-    u_min=-0.5,
-    u_max=0.5,
-    use_trust_region=True,
-    trust_region_iters=3,
-    trust_region_size=0.5,
-    use_mu_scheduling=False,
-    mu_schedule_type='stepwise',
-    mu_start=1e-3,
-    mu_end=1e-6,
-    u_init_mode='zero'
-)
-
-result_demo = sqp_solver.optimize(
-    q0=q0, v0=v0, pusher0=pusher0, goal=goal,
-    cfg=cfg_demo, w=w_true, verbose=True,
-)
-
-u_demo = result_demo['u_seq']
-print(f"\nDemo generated. Final loss: {result_demo['loss']:.4f}")
-print(f"Position error: {result_demo['stationarityInfo']['final_terminal_error']:.4f}m")
-
-demo = pack_demo(q0, v0, pusher0, goal, u_demo)
-
-# ---------------------------------------------------------------------------
-# Step 2: Feature matching IRL
-# ---------------------------------------------------------------------------
-
-print("\n" + "="*60)
-print("Step 2: Feature Matching IRL")
-print("="*60)
 
 irl = IRLSolver(
-    mass=MASS, side_length=SIDE, mu=MU,
-    horizon=HORIZON, dt=DT,
-    device=device,
-    dynamics_solver='IP',
-    ipm_opts=ipm_opts,
-)
-
-cfg_irl = IRLConfig(
-    max_outer_iters=1,
-    lr_weights=0.1,
-    weight_tol=1e-4,
-    max_inner_iters=20,   # Adam steps for inner solve in feature matching
-    verbose=True,
-    log_every=5,
-)
-
-result_irl = irl.fit_feature_matching(demo, cfg=cfg_irl)
-
-# ---------------------------------------------------------------------------
-# Step 2b: Control Matching QP IRL (main test)
-# ---------------------------------------------------------------------------
-
-print("\n" + "="*60)
-print("Step 2b: Control Matching QP IRL")
-print("="*60)
-
-irl_cm = IRLSolver(
-    mass=MASS, side_length=SIDE, mu=MU,
-    horizon=HORIZON, dt=DT,
-    device=device,
-    dynamics_solver='IP',
-    ipm_opts=ipm_opts,
+    mass=phys['mass'], side_length=phys['side'], mu=phys['mu'],
+    horizon=phys['horizon'], dt=phys['dt'],
+    device=device, ipm_opts=ipm_opts,
     sqp_solver=sqp_solver,
 )
 
-cfg_cm = IRLConfig(
-    max_outer_iters=20,
-    max_inner_iters=30,
-    weight_tol=1e-4,
-    hessian_reg=1e-4,
-    warm_start_inner=True,
-    verbose=True,
-    log_every=1,
-)
-
-# Uniform weight init
-w_init = torch.ones(4, dtype=torch.float64) / 4
-
-result_cm = irl_cm.fit_control_matching_qp(demo, w_init=w_init, cfg=cfg_cm)
-
 # ---------------------------------------------------------------------------
-# Step 3: Compare weights
+# Method 1: KKT Residual
 # ---------------------------------------------------------------------------
 
-print("\n" + "="*60)
-print("Step 3: Weight Comparison")
-print("="*60)
+print(f"\n{'='*60}")
+print("Method 1: KKT Residual")
+print(f"{'='*60}")
 
-w_true_vec = torch.tensor(
-    [w_true.wTargetXY, w_true.wTargetOrient, w_true.wObjVel, w_true.wControl],
-    dtype=torch.float64
-)
-w_true_norm = w_true_vec / w_true_vec.sum()
-names = IRLSolver.WEIGHT_NAMES
-
-for label, w_rec in [("Feature Matching", result_irl['w_recovered']),
-                     ("Control Matching QP", result_cm['w_recovered'])]:
-    print(f"\n--- {label} ---")
-    print(f"{'Name':12s} {'True (norm)':>12s} {'Recovered':>12s} {'Abs Error':>12s}")
-    print("-" * 52)
-    for name, wt, wr in zip(names, w_true_norm, w_rec.cpu()):
-        err = abs(wt.item() - wr.item())
-        print(f"{name:12s} {wt.item():12.6f} {wr.item():12.6f} {err:12.6f}")
-    l2 = torch.norm(w_rec.cpu() - w_true_norm).item()
-    print(f"L2 error: {l2:.6f}")
+result_kkt = irl.fit_weights_kkt_residual(all_demos, verbose=True)
+w_kkt = result_kkt['w_recovered'].cpu().numpy()
 
 # ---------------------------------------------------------------------------
-# Convergence plot (optional)
+# Method 2: Control Matching EG  (KKT result as warm start)
 # ---------------------------------------------------------------------------
+
+if not args.skip_eg:
+    print(f"\n{'='*60}")
+    print("Method 2: Control Matching EG")
+    print(f"{'='*60}")
+
+    cfg = IRLConfig(
+        max_outer_iters      = args.outer_iters,
+        max_inner_iters      = args.inner_iters,
+        lr_weights           = args.lr,
+        weight_tol           = args.weight_tol,
+        lr_patience          = 5,
+        lr_factor            = 0.5,
+        lr_min               = 1e-5,
+        inner_cost_tol       = 1e-7,
+        inner_proj_grad_tol  = 1e-4,
+        warm_start_inner     = True,
+        hessian_reg          = 1e-2,
+        u_min                = -0.5,
+        u_max                =  0.5,
+        verbose              = True,
+        log_every            = 1,
+    )
+
+    result_eg = irl.fit_control_matching_eg(
+        all_demos,
+        w_init=result_kkt['w_recovered'].clone(),
+        cfg=cfg,
+    )
+    w_eg = result_eg['w_recovered'].cpu().numpy()
+
+# ---------------------------------------------------------------------------
+# Results comparison
+# ---------------------------------------------------------------------------
+
+print(f"\n{'='*60}")
+print("Weight Comparison")
+print(f"{'='*60}")
+header = f"{'Name':12s} {'True':>10s} {'KKT':>10s}"
+if not args.skip_eg:
+    header += f" {'EG':>10s}"
+print(header)
+print("-" * len(header))
+
+for i, name in enumerate(wnames):
+    row = f"{name:12s} {w_true[i]:10.4f} {w_kkt[i]:10.4f}"
+    if not args.skip_eg:
+        row += f" {w_eg[i]:10.4f}"
+    print(row)
+
+print(f"\nL2 error  KKT: {np.linalg.norm(w_kkt - w_true):.4f}", end='')
+if not args.skip_eg:
+    print(f"   EG: {np.linalg.norm(w_eg - w_true):.4f}", end='')
+print()
+
+if not args.skip_eg:
+    n_conv  = sum(result_eg['inner_converged_history'])
+    n_total = len(result_eg['inner_converged_history'])
+    pg      = result_eg['inner_proj_grad_history']
+    print(f"\nInner convergence: {n_conv}/{n_total} iters converged")
+    print(f"  proj_grad range: [{min(pg):.2e}, {max(pg):.2e}]")
+
+# ---------------------------------------------------------------------------
+# Plot (EG iteration history + final bar chart)
+# ---------------------------------------------------------------------------
+
+if args.skip_eg:
+    sys.exit(0)
 
 try:
     import matplotlib.pyplot as plt
 
+    iters  = range(len(result_eg['loss_history']))
+    w_hist = np.array(result_eg['w_history'])
+
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig.suptitle('IRL Control Matching EG', fontsize=13)
 
-    for row, (label, res) in enumerate([("Feature Matching", result_irl),
-                                         ("Control Matching QP", result_cm)]):
-        axes[row, 0].semilogy(res['loss_history'])
-        axes[row, 0].set_title(f'{label} - Loss')
-        axes[row, 0].set_xlabel('Outer iteration')
-        axes[row, 0].grid(True, alpha=0.3)
+    # Outer loss
+    axes[0, 0].semilogy(iters, result_eg['loss_history'])
+    axes[0, 0].set_title('Outer Loss ||u*−u_demo||²')
+    axes[0, 0].set_xlabel('Outer iter')
+    axes[0, 0].grid(True, alpha=0.3)
 
-        axes[row, 1].semilogy(res['grad_norm_history'])
-        axes[row, 1].set_title(f'{label} - Gradient Norm')
-        axes[row, 1].set_xlabel('Outer iteration')
-        axes[row, 1].grid(True, alpha=0.3)
+    # Outer grad norm
+    axes[0, 1].semilogy(iters, result_eg['grad_norm_history'])
+    axes[0, 1].set_title('|grad_w| (IFT analytical)')
+    axes[0, 1].set_xlabel('Outer iter')
+    axes[0, 1].grid(True, alpha=0.3)
 
-        w_hist = np.array(res['w_history'])
-        for i, name in enumerate(names):
-            axes[row, 2].plot(w_hist[:, i], label=name)
-        for i, wt in enumerate(w_true_norm):
-            axes[row, 2].axhline(wt.item(), linestyle='--', alpha=0.4)
-        axes[row, 2].set_title(f'{label} - Weight Trajectory')
-        axes[row, 2].set_xlabel('Outer iteration')
-        axes[row, 2].legend(fontsize=8)
-        axes[row, 2].grid(True, alpha=0.3)
+    # Inner proj grad norm
+    axes[0, 2].semilogy(iters, result_eg['inner_proj_grad_history'], 'r-o', ms=3)
+    axes[0, 2].axhline(cfg.inner_proj_grad_tol, ls='--', color='gray',
+                       alpha=0.6, label=f'tol={cfg.inner_proj_grad_tol:.0e}')
+    axes[0, 2].set_title('Inner Proj Grad Norm (SQP)')
+    axes[0, 2].legend()
+    axes[0, 2].set_xlabel('Outer iter')
+    axes[0, 2].grid(True, alpha=0.3)
+
+    # Weight trajectory
+    for i, name in enumerate(wnames):
+        axes[1, 0].plot(iters, w_hist[:, i], label=name)
+    for wt in w_true:
+        axes[1, 0].axhline(wt, ls='--', alpha=0.3, color='gray')
+    axes[1, 0].set_title('Weight Trajectory')
+    axes[1, 0].legend(fontsize=8)
+    axes[1, 0].set_xlabel('Outer iter')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Control error + LR
+    ax_ctrl = axes[1, 1]
+    ax_ctrl.plot(iters, result_eg['control_error_history'])
+    ax_ctrl.set_title('Control Error + LR')
+    ax_ctrl.set_xlabel('Outer iter')
+    ax_ctrl.grid(True, alpha=0.3)
+    ax_lr = ax_ctrl.twinx()
+    ax_lr.semilogy(iters, result_eg['lr_history'], 'g--', alpha=0.5)
+    ax_lr.set_ylabel('lr', color='g')
+
+    # Final weight bar chart (True / KKT / EG)
+    x = np.arange(len(wnames))
+    w = 0.25
+    axes[1, 2].bar(x - w, w_true, w, label='True',  alpha=0.85)
+    axes[1, 2].bar(x,     w_kkt,  w, label='KKT',   alpha=0.85)
+    axes[1, 2].bar(x + w, w_eg,   w, label='EG',    alpha=0.85)
+    axes[1, 2].set_xticks(x)
+    axes[1, 2].set_xticklabels(wnames, rotation=15, fontsize=8)
+    axes[1, 2].set_title('Final Weights')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
-    plt.savefig('irl_results.png', dpi=150)
-    print("\nPlot saved: irl_results.png")
+    out = 'irl_result.png'
+    plt.savefig(out, dpi=150)
+    print(f"\nPlot saved: {out}")
 
 except ImportError:
-    print("\n(matplotlib not available, skipping plot)")
+    print("\n(matplotlib not available)")

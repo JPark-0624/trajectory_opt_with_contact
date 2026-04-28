@@ -35,7 +35,12 @@ def pack_demo(q0, v0, pusher0, goal, u_demo, obstacle_pos=None) -> Dict:
 # ---------- NPZ (portable, language-agnostic) ----------
 def save_demo_npz(demo: Dict, path: str):
     ensure_dir(path)
-    np.savez_compressed(path, **{k: _to_numpy(v) for k, v in demo.items()})
+    save_dict = {}
+    for k, v in demo.items():
+        if v is None:
+            continue   # skip None fields (e.g. obstacle_pos)
+        save_dict[k] = _to_numpy(v)
+    np.savez_compressed(path, **save_dict)
 
 def load_demo_npz(path: str) -> Dict:
     data = np.load(path, allow_pickle=True)

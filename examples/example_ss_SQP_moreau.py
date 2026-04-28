@@ -56,7 +56,7 @@ optimizer = SingleShootingSQPGaussNewton(
     mass=1.0,
     side_length=0.2,
     mu=0.5,
-    horizon=60,
+    horizon=30,
     dt=0.05,
     device=device,
     dynamics_module=dynamics_fn,
@@ -67,8 +67,8 @@ optimizer = SingleShootingSQPGaussNewton(
 # Diagonal push
 q0 = [0.0, 0.0, 0.0]
 v0 = [0.0, 0.0, 0.0]
-pusher0 = [-0.2, 0.0]
-goal = [0.5, 0.2, 0.3]
+pusher0 = [-0.1, -0.3]
+goal = [0.2,  0.5, -0.3]
 
 # Or X-axis push:
 # q0 = [0.0, 0.0, 0.0]
@@ -81,15 +81,16 @@ print(f"Goal pose: {goal}")
 
 # SQP configuration with Gauss-Newton
 cfg = SQPConfig(
-    maxIters=50,
-    tol=1e-4,
+    maxIters=60,
+    cost_tol=1e-7,
+    proj_grad_tol=1e-4,
     use_gauss_newton=True,  # ⭐ Enable Gauss-Newton Hessian (P = J^T J)
     hessian_regularization=1e-6,  # Regularization λ for P + λI
     use_line_search=True,
     line_search_max_iters=10,
     line_search_beta=0.5,
-    u_min=-0.3,
-    u_max=0.3,
+    u_min=-0.5,
+    u_max=0.5,
     use_trust_region=True,
     trust_region_iters=3,
     trust_region_size=0.5,
@@ -100,14 +101,26 @@ cfg = SQPConfig(
     u_init_mode='zero'
 )
 
-# Cost weights (matching visualize_example: w_target=20, w_orient=0.5, w_v=1.0, w_ctrl=0.01)
+# Cost weights
 w = CostWeights(
     wControl=0.01,         # Matches w_ctrl
     wControlSmooth=0.0,
     wObjVel=1.0,          # Matches w_v (terminal velocity!)
     wTargetXY=20.0,       # Matches w_target
     wTargetOrient=1.0,    # Matches w_orient
+    wContact=3.0,         # Contact maintenance: penalize separation
 )
+
+# Normalized weights (optional - can use unnormalized since we have regularization)
+# w = CostWeights(
+#     wControl=0.0004,         # Matches w_ctrl
+#     wControlSmooth=0.0,
+#     wObjVel=0.04,          # Matches w_v (terminal velocity!)
+#     wTargetXY=0.7997,       # Matches w_target
+#     wTargetOrient=0.04,    # Matches w_orient
+#     wContact=0.12,         # Contact maintenance: penalize separation
+# )
+
 
 # Initial guess (optional - will use simple init if None)
 u_init = None
@@ -116,7 +129,7 @@ print("\n" + "="*60)
 print("Gauss-Newton Configuration:")
 print("="*60)
 print(f"  Hessian type: P = J^T J (residual Jacobian)")
-print(f"  Residual dim: {2*optimizer.horizon + 6}")
+print(f"  Residual dim: {2*optimizer.horizon + 6 + optimizer.horizon} (ctrl={2*optimizer.horizon}, goal=2, orient=1, vel=3, contact={optimizer.horizon})")
 print(f"  Decision vars: {2*optimizer.horizon}")
 print(f"  Regularization: {cfg.hessian_regularization}")
 print("="*60 + "\n")
@@ -141,6 +154,7 @@ print(f"Final pose [x,y,theta]: {result['q_final']}")
 print(f"Goal: {goal}")
 print(f"Position error: {result['q_final'] - goal}")
 print(f"Gradient norm: {result['stationarityInfo']['final_grad_norm']:.6e}")
+print(f"Projected Gradient norm : {result['stationarityInfo']['final_proj_grad_norm']:.6e}")
 print(f"Converged: {result['stationarityInfo']['converged']}")
 print(f"Solve time: {result['solve_time']:.2f}s")
 print(f"{'='*60}")
@@ -174,13 +188,14 @@ except Exception as e:
 print("\nSummary:")
 print(f"  Final position error: {result['q_final'][:2] - goal[:2]}")
 print(f"  Final orientation error: {result['q_final'][2] - goal[2]:.4f} rad")
-print(f"  Gradient norm: {result['stationarityInfo']['final_grad_norm']:.6e}")
+print(f"  Gradient norm: {result['stationarityInfo']['final_grad_norm']:.6e}  (projected: {result['stationarityInfo']['final_proj_grad_norm']:.6e})")
 print(f"  Total solve time: {result['solve_time']:.2f}s")
-
+ 
 # Print history summary
 print("\nConvergence history:")
 print(f"  Loss: {result['history']['loss'][0]:.4f} → {result['history']['loss'][-1]:.4f}")
 print(f"  Grad norm: {result['history']['grad_norm'][0]:.2e} → {result['history']['grad_norm'][-1]:.2e}")
+print(f"  Proj grad: {result['history']['proj_grad_norm'][0]:.2e} → {result['history']['proj_grad_norm'][-1]:.2e}")
 if len(result['history']['alpha']) > 0:
     print(f"  Step sizes (first 5): {[f'{a:.3f}' for a in result['history']['alpha'][:5]]}")
     print(f"  Step sizes (last 3): {[f'{a:.3f}' for a in result['history']['alpha'][-3:]]}")
