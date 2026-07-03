@@ -25,8 +25,9 @@ def wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
 class SQPConfig:
     """SQP optimizer configuration"""
     maxIters: int = 20
-    tol: float = 1e-4        # gradient norm convergence
+    tol: float = 1e-4        # gradient norm convergence (legacy)
     cost_tol: float = 1e-6   # cost change convergence
+    proj_grad_tol: float = 1e-4  # projected gradient norm convergence (KKT)
     
     # Line search
     use_line_search: bool = True
@@ -49,7 +50,7 @@ class SQPConfig:
     hessian_regularization: float = 1e-6
 
     # Initial guess ('geometric' or 'zero')
-    u_init_mode: str = 'geometric'
+    u_init_mode: str = 'zero'
     
     # IPM target_mu scheduling
     use_mu_scheduling: bool = False  # Enable scheduling
@@ -71,6 +72,7 @@ class CostWeights:
     wObjVel: object = 1.0  # Terminal velocity
     wTargetXY: object = 20.0
     wTargetOrient: object = 0.5
+    wContact: object = 0.0  # Contact maintenance: penalize phi > 0 (separation)
 
 
 class SingleShootingSQPGaussNewton:
@@ -239,9 +241,9 @@ class SingleShootingSQPGaussNewton:
         where each component is scaled by sqrt(weight) so that:
             f(u) = (1/2) ||r(u)||² = sum of weighted squared terms
         """
-        # Forward simulate
-        qs, vs, _, terminalVelEnergy, _, _ = self.forward_simulate(
-            q0, v0, pusher0, u, store_contact_data=False
+        # Forward simulate with contact data (phi needed for contact residual)
+        qs, vs, _, terminalVelEnergy, _, phis = self.forward_simulate(
+            q0, v0, pusher0, u, store_contact_data=True
         )
         
         qFinal = qs[-1]
@@ -270,9 +272,15 @@ class SingleShootingSQPGaussNewton:
         # --- Terminal velocity residuals ---
         # r_vel = sqrt(wObjVel) * v_final
         r_vel = torch.sqrt(_as_tensor(w.wObjVel)) * vFinal
-        
-        # Concatenate all residuals
-        r = torch.cat([r_control, r_target, r_orient, r_vel])
+
+        # --- Contact maintenance residuals ---
+        # phi_t > 0: pusher separated from box → penalize
+        # phi_t <= 0: in contact → no penalty
+        # gradient flows through phi via StepSquarePosIPFn.backward()
+        r_contact = torch.sqrt(_as_tensor(w.wContact)) * phis.clamp(min=0.0)
+
+        # Concatenate: [ctrl(T*2), target_xy(2), orient(1), vel(3), contact(T)]
+        r = torch.cat([r_control, r_target, r_orient, r_vel, r_contact])
         
         return r
     
@@ -436,8 +444,9 @@ class SingleShootingSQPGaussNewton:
             P_values = torch.eye(n, dtype=torch.float64, device=self.device).flatten()
         g_vec = g_torch  # shape (n,), torch.Tensor with grad
 
-        self._moreau_torch_solver.setup(P_values, A_values)
-        solution = self._moreau_torch_solver.solve(g_vec, b_vec)
+        # self._moreau_torch_solver.setup(P_values, A_values)
+        # solution = self._moreau_torch_solver.solve(g_vec, b_vec)
+        solution = self._moreau_torch_solver.solve(P_values, A_values, g_vec, b_vec)  # Test solve with explicit matrices
         timing['qp_solve'] = time.time() - t0
 
         delta_u = solution.x.reshape(self.horizon, 2)  # gradient flows through g_vec -> w
@@ -454,8 +463,8 @@ class SingleShootingSQPGaussNewton:
         w: CostWeights,
     ) -> Dict:
         """Evaluate cost and return detailed breakdown."""
-        qs, vs, prs, terminalVelEnergy, _, _ = self.forward_simulate(
-            q0, v0, pusher0, u, store_contact_data=False
+        qs, vs, prs, terminalVelEnergy, _, phis = self.forward_simulate(
+            q0, v0, pusher0, u, store_contact_data=True
         )
         
         # Cost components
@@ -470,13 +479,24 @@ class SingleShootingSQPGaussNewton:
         orientCost = rTh ** 2
         
         terminalVelCost = terminalVelEnergy
+
+        # Contact: sum of squared separation distances over trajectory
+        contactCost = (phis.clamp(min=0.0) ** 2).sum()
+        # Fraction of timesteps with significant separation (phi > 0.01m threshold)
+        contactSeparationRatio = (phis > 0.01).float().mean()
+        # Mean phi (positive = separated, negative = penetrating)
+        meanPhi = phis.mean()
         
+        def _w(val):
+            return float(val) if not isinstance(val, torch.Tensor) else val.item()
+
         loss = (
-            w.wControl * controlEnergy +
-            w.wControlSmooth * controlSmooth +
-            w.wObjVel * terminalVelCost +
-            w.wTargetXY * targetCost +
-            w.wTargetOrient * orientCost
+            _w(w.wControl)       * controlEnergy +
+            _w(w.wControlSmooth) * controlSmooth +
+            _w(w.wObjVel)        * terminalVelCost +
+            _w(w.wTargetXY)      * targetCost +
+            _w(w.wTargetOrient)  * orientCost +
+            _w(w.wContact)       * contactCost
         )
         
         return {
@@ -491,6 +511,10 @@ class SingleShootingSQPGaussNewton:
             "terminalVelEnergy": terminalVelEnergy,
             "terminalXYNorm": torch.norm(rXY),
             "terminalThetaAbs": torch.abs(rTh),
+            "contactCost": contactCost,
+            "contactSeparationRatio": contactSeparationRatio,
+            "meanPhi": meanPhi,
+            "phis": phis,
         }
     
     def optimize(
@@ -560,10 +584,14 @@ class SingleShootingSQPGaussNewton:
         cost_curr = None
         start_time = time.time()
         
+        n = self.horizon * 2
+        N_w = 4  # [w_target, w_orient, w_v, w_ctrl]
+        
         # History tracking
         history = {
             'loss': [],
             'grad_norm': [],
+            'proj_grad_norm': [],
             'step_norm': [],
             'cost_change': [],
             'alpha': [],
@@ -620,9 +648,23 @@ class SingleShootingSQPGaussNewton:
             # Gradient norm
             grad_norm = g_vec.detach().norm().item()
             history['grad_norm'].append(grad_norm)
-            
+
+            # Projected gradient norm (KKT residual for box constraints)
+            # proj_grad_i = 0 if KKT satisfied at bound, else ∂f/∂u_i
+            #   u = u_max: KKT requires ∂f/∂u ≤ 0 → violation if > 0
+            #   u = u_min: KKT requires ∂f/∂u ≥ 0 → violation if < 0
+            #   interior:  KKT requires ∂f/∂u = 0  → always include
+            with torch.no_grad():
+                g_flat  = g_vec.detach().flatten()
+                u_flat  = u_curr.detach().flatten()
+                proj_g  = g_flat.clone()
+                proj_g[(u_flat >= cfg.u_max - 1e-6) & (g_flat <= 0)] = 0.0
+                proj_g[(u_flat <= cfg.u_min + 1e-6) & (g_flat >= 0)] = 0.0
+                proj_grad_norm = proj_g.norm().item()
+            history['proj_grad_norm'].append(proj_grad_norm)
+
             if verbose:
-                print(f"  Gradient norm: {grad_norm:.6e}")
+                print(f"  Gradient norm: {grad_norm:.6e}  (projected: {proj_grad_norm:.6e})")
                 print(f"  ⏱ Timing:")
                 print(f"    Hessian+QP build: {hessian_time:.2f}s", end="")
                 if cfg.use_gauss_newton and 'jacobian_computation' in qp_timing:
@@ -715,6 +757,7 @@ class SingleShootingSQPGaussNewton:
                     print(f"    Target XY: {w.wTargetXY * result['terminalXYNormSq'].item():.6f}")
                     print(f"    Orient: {w.wTargetOrient * result['terminalOrientNormSq'].item():.6f}")
                     print(f"    Terminal vel: {w.wObjVel * result['terminalVelEnergy'].item():.6f}")
+                    print(f"    Contact: {w.wContact * result['contactCost'].item():.6f} (sep>1cm={result['contactSeparationRatio'].item()*100:.1f}%, mean_phi={result['meanPhi'].item():.4f}m)")
                     
                     # Final position vs goal
                     q_final = result['qs'][-1].detach().cpu().numpy()
@@ -724,14 +767,11 @@ class SingleShootingSQPGaussNewton:
                     print(f"  Position error: {result['terminalXYNorm'].item():.4f}m")
                     print(f"  Orientation error: {result['terminalThetaAbs'].item():.4f}rad")
                 
-                # Convergence check
-                if grad_norm < cfg.tol:
+                # Convergence check: cost change AND projected gradient (KKT)
+                if cost_change < cfg.cost_tol and proj_grad_norm < cfg.proj_grad_tol:
                     if verbose:
-                        print(f"\n✓ Converged! Gradient norm {grad_norm:.6e} < {cfg.tol}")
-                    break
-                if cost_change < cfg.cost_tol:
-                    if verbose:
-                        print(f"\n✓ Converged! Cost change {cost_change:.2e} < {cfg.cost_tol}")
+                        print(f"\n✓ Converged! cost_change={cost_change:.2e} < {cfg.cost_tol}"
+                              f"  proj_grad={proj_grad_norm:.2e} < {cfg.proj_grad_tol}")
                     break
             else:
                 history['cost_change'].append(0.0)
@@ -755,9 +795,40 @@ class SingleShootingSQPGaussNewton:
             u_curr, q0, v0, pusher0, goal, w,
             regularization=cfg.hessian_regularization
         )
-        # Recompute P cleanly (without regularization) for IFT — caller can add reg if needed
         P_final = J_r_final.T @ J_r_final
         final_grad_norm = torch.norm(g_final_torch).item()
+
+        # Projected gradient norm at final u*
+        with torch.no_grad():
+            g_flat = g_final_torch.detach().flatten()
+            u_flat = u_curr.detach().flatten()
+            proj_g = g_flat.clone()
+            proj_g[(u_flat >= cfg.u_max - 1e-6) & (g_flat <= 0)] = 0.0
+            proj_g[(u_flat <= cfg.u_min + 1e-6) & (g_flat >= 0)] = 0.0
+            final_proj_grad_norm = proj_g.norm().item()
+
+        # Analytical du_dw = -P_K^{-1} M_K  (computed once at final u*)
+        # Residual blocks: [ctrl(n), target_xy(2), orient(1), vel(3)]
+        # Column order: [w_target(0), w_orient(1), w_v(2), w_ctrl(3)]
+        with torch.no_grad():
+            n_res = r_final.shape[0]
+            T = self.horizon
+            block_sizes  = [n, 2, 1, 3, T]                                          # ctrl, target_xy, orient, vel, contact
+            block_w_vals = [w.wControl, w.wTargetXY, w.wTargetOrient, w.wObjVel, w.wContact]
+            block_col    = [3, 0, 1, 2, 4]   # residual block i → weight column
+            N_W = 5
+            dr_dw_final  = torch.zeros(n_res, N_W, dtype=torch.float64, device=self.device)
+            idx = 0
+            for i, bs in enumerate(block_sizes):
+                wi = float(block_w_vals[i]) if not isinstance(block_w_vals[i], torch.Tensor) \
+                     else block_w_vals[i].item()
+                wi = max(wi, 1e-8)
+                dr_dw_final[idx:idx+bs, block_col[i]] = r_final[idx:idx+bs] / (2.0 * wi)
+                idx += bs
+            M_final = J_r_final.T @ dr_dw_final  # (n, N_W)
+            P_reg   = P_final + cfg.hessian_regularization * torch.eye(
+                n, dtype=torch.float64, device=self.device)
+            du_dw_analytical = -torch.linalg.solve(P_reg, M_final)  # (n, N_W)
         
         # # Initial trajectory
         # if u_init is None:
@@ -791,7 +862,7 @@ class SingleShootingSQPGaussNewton:
             print(f"Time: {solve_time:.2f}s")
             print(f"Iterations: {iteration+1}")
             print(f"Final loss: {loss_final.item():.6f}")
-            print(f"Final gradient norm: {final_grad_norm:.6e}")
+            print(f"Final gradient norm: {final_grad_norm:.6e}  (projected: {final_proj_grad_norm:.6e})")
             print(f"Position error: {torch.norm(rXY).item():.4f}m")
             print(f"Orientation error: {abs(rTheta.item()):.4f}rad")
             print(f"{'='*70}")
@@ -865,11 +936,13 @@ class SingleShootingSQPGaussNewton:
                 "P": P_final.detach(),        # (n, n)  Gauss-Newton Hessian (no reg)
                 "J_r": J_r_final.detach(),    # (n_res, n)  residual Jacobian
                 "r": r_final.detach(),        # (n_res,)    residuals at u*
+                "du_dw_analytical": du_dw_analytical.detach(),  # (n, N_w) chain rule
             },
             
             "history": {
                 'loss': np.array(history['loss']),
                 'grad_norm': np.array(history['grad_norm']),
+                'proj_grad_norm': np.array(history['proj_grad_norm']),
                 'step_norm': np.array(history['step_norm']),
                 'cost_change': np.array(history['cost_change']),
                 'alpha': np.array(history['alpha']),
@@ -885,13 +958,146 @@ class SingleShootingSQPGaussNewton:
             "stationarityInfo": {
                 "final_defect_norm": 0.0,
                 "final_grad_norm": final_grad_norm,
+                "final_proj_grad_norm": final_proj_grad_norm,
                 "final_terminal_error": torch.norm(rXY).item(),
-                "converged": final_grad_norm < cfg.tol,
+                "converged": final_proj_grad_norm < cfg.proj_grad_tol,
             },
             
             "solve_time": solve_time,
         }
     
+    def optimize_differentiable(
+        self,
+        q0, v0, pusher0, goal,
+        w: 'CostWeights',
+        K: int = 20,
+        reg: float = 1e-4,
+        u_init=None,
+        verbose: bool = False,
+    ) -> torch.Tensor:
+        """
+        K iterations of SQP with full computational graph (autograd method).
+
+        w fields must be torch.Tensor with requires_grad=True.
+        Returns u_K with gradient path to w: ∂u_K/∂w via autograd.
+
+        Each iteration:
+            r_k  = compute_residuals(u_k, w)   [w에 depend]
+            J_k  = ∂r_k/∂u_k                   [autograd, create_graph=True]
+            g_k  = J_k^T r_k                   [w에 depend]
+            P_k  = J_k^T J_k + reg*I
+            δu_k = moreau_torch(P_k, g_k)      [IFT: ∂δu/∂g]
+            u_{k+1} = u_k + δu_k               [graph 유지]
+        """
+        q0      = self._to_tensor(q0)
+        v0      = self._to_tensor(v0)
+        pusher0 = self._to_tensor(pusher0)
+        goal    = self._to_tensor(goal)
+
+        n = self.horizon * 2
+
+        # Initial controls (detached — u_init does not depend on w)
+        if u_init is None:
+            u = torch.zeros(self.horizon, 2, dtype=torch.float64, device=self.device)
+        else:
+            u = self._to_tensor(u_init)
+
+        reg_mat         = reg * torch.eye(n, dtype=torch.float64, device=self.device)
+        final_proj_grad = float('inf')
+
+        for k in range(K):
+            # J_r = ∂r/∂u via autograd
+            # u를 leaf로 분리해서 J를 구하되, create_graph=True로 ∂J/∂w 확보
+            u_leaf = u.detach().flatten().requires_grad_(True)
+            with torch.enable_grad():
+                J = torch.autograd.functional.jacobian(
+                    lambda u_: self.compute_residuals(
+                        u_.reshape(self.horizon, 2), q0, v0, pusher0, goal, w
+                    ),
+                    u_leaf,
+                    create_graph=True,
+                    vectorize=True,    # moreau backward is not compatible with vmap 
+                    strategy='reverse-mode',
+                )
+                # r: w에만 dependent (u는 현재 값으로 고정, w를 통한 graph 유지)
+                r = self.compute_residuals(u, q0, v0, pusher0, goal, w)
+
+            # g = J^T r: w에 dependent (r이 w에 depend, J도 create_graph)
+            # P = J^T J + reg
+            g = J.T @ r
+            P = J.T @ J + reg_mat
+
+            # moreau QP: δu = argmin 0.5 δu^T P δu + g^T δu  s.t. box
+            # b_vec: 현재 u 기준 box offset — u의 graph 포함
+            u_flat = u.flatten()
+            b_vec = torch.stack([
+                u_flat - (-0.5),   # lower bound offset
+                0.5 - u_flat,      # upper bound offset
+            ], dim=1).flatten()
+
+            A_values = torch.tensor(
+                [-1.0, 1.0], dtype=torch.float64, device=self.device
+            ).repeat(n)
+
+            # self._moreau_torch_solver.setup(P.flatten(), A_values)
+            # sol = self._moreau_torch_solver.solve(g, b_vec)
+            sol = self._moreau_torch_solver.solve(P.flatten(), A_values, g, b_vec)
+            delta_u = sol.x.reshape(self.horizon, 2)
+
+            # Backtracking line search (Armijo condition)
+            # cost evaluated with detach to avoid graph accumulation
+            # step applied with graph: u = u + alpha * delta_u
+            with torch.no_grad():
+                cost_curr = 0.5 * r.detach().dot(r.detach())
+                g_flat_d  = g.detach().flatten()
+                du_flat_d = delta_u.detach().flatten()
+                slope     = g_flat_d @ du_flat_d   # should be negative (descent)
+
+            alpha    = 1.0
+            beta     = 0.5
+            c_armijo = 1e-4
+            max_ls   = 10
+
+            for _ in range(max_ls):
+                u_trial = u.detach() + alpha * delta_u.detach()
+                with torch.no_grad():
+                    r_trial   = self.compute_residuals(u_trial, q0, v0, pusher0, goal, w)
+                    cost_trial = 0.5 * r_trial.dot(r_trial)
+                if cost_trial <= cost_curr + c_armijo * alpha * slope:
+                    break
+                alpha *= beta
+
+            # u graph 유지: alpha는 scalar constant, delta_u는 grad_fn 보유
+            u = u + alpha * delta_u
+
+            if verbose:
+                with torch.no_grad():
+                    g_flat   = g.detach().flatten()
+                    u_flat_d = u.detach().flatten()
+                    proj_g   = g_flat.clone()
+                    proj_g[(u_flat_d >= 0.5 - 1e-6) & (g_flat <= 0)] = 0.0
+                    proj_g[(u_flat_d <= -0.5 + 1e-6) & (g_flat >= 0)] = 0.0
+                    grad_norm       = g_flat.norm().item()
+                    proj_grad_norm  = proj_g.norm().item()
+                    final_proj_grad = proj_grad_norm
+                print(f"  [autograd] iter {k:3d}: grad={grad_norm:.3e}  "
+                      f"proj={proj_grad_norm:.3e}  alpha={alpha:.3f}")
+                if proj_grad_norm < 1e-4:
+                    print(f"  Converged at iter {k} (proj_grad < 1e-4)")
+                    break
+            else:
+                with torch.no_grad():
+                    g_flat   = g.detach().flatten()
+                    u_flat_d = u.detach().flatten()
+                    proj_g   = g_flat.clone()
+                    proj_g[(u_flat_d >= 0.5 - 1e-6) & (g_flat <= 0)] = 0.0
+                    proj_g[(u_flat_d <= -0.5 + 1e-6) & (g_flat >= 0)] = 0.0
+                    final_proj_grad = proj_g.norm().item()
+                    if final_proj_grad < 1e-4:
+                        break
+
+        return u, final_proj_grad   # u: grad_fn 있음, final_proj_grad: 수렴 판단용
+
     def _to_tensor(self, x):
         """Convert to tensor if needed"""
         if not isinstance(x, torch.Tensor):

@@ -51,7 +51,9 @@ def tangent_frame(n: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Build an orthonormal tangent frame {t1, t2} given unit normal n.
 
-    Uses Duff et al. (2017) branchless method for numerical stability.
+    Prefer a gravity-aligned tangent when the contact normal is not vertical.
+    This keeps side contacts from flipping tangent direction due to tiny
+    numerical changes in n_z near zero.
 
     Args:
         n: (3,) unit normal vector
@@ -59,23 +61,14 @@ def tangent_frame(n: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     Returns:
         t1, t2: (3,) unit tangent vectors s.t. {n, t1, t2} right-handed
     """
-    # Choose reference axis least aligned with n to avoid degeneracy
-    sign = torch.where(n[2] >= 0,
-                       torch.ones(1, dtype=n.dtype, device=n.device),
-                       -torch.ones(1, dtype=n.dtype, device=n.device)).squeeze()
-    a = -1.0 / (sign + n[2])
-    b = n[0] * n[1] * a
+    down = torch.tensor([0.0, 0.0, -1.0], dtype=n.dtype, device=n.device)
+    x_axis = torch.tensor([1.0, 0.0, 0.0], dtype=n.dtype, device=n.device)
+    ref = torch.where(torch.abs(n[2]) < 0.9, down, x_axis)
 
-    t1 = torch.stack([
-        1.0 + sign * n[0]**2 * a,
-        sign * b,
-        -sign * n[0],
-    ])
-    t2 = torch.stack([
-        b,
-        sign + n[1]**2 * a,
-        -n[1],
-    ])
+    t1 = ref - torch.dot(ref, n) * n
+    t1 = t1 / (torch.linalg.norm(t1) + 1e-12)
+    t2 = torch.linalg.cross(n, t1)
+    t2 = t2 / (torch.linalg.norm(t2) + 1e-12)
 
     return t1, t2
 
@@ -120,47 +113,133 @@ class SDFGrid:
         self.device     = phi_grid.device
 
     @staticmethod
+    def _auto_resolution(workspace: float, r_sphere: float) -> int:
+        """
+        Compute the minimum grid resolution such that cell size < r_sphere.
+
+        Condition:  2 * workspace / (N - 1) < r_sphere
+        → N > 2 * workspace / r_sphere + 1
+        Round up to next power of 2 for GPU efficiency.
+
+        Args:
+            workspace: half-extent of the grid in each axis [m]
+            r_sphere:  sphere radius [m]  (precision target)
+
+        Returns:
+            N: grid resolution
+        """
+        n_min = int(2.0 * workspace / r_sphere) + 2
+        # Next power of 2 >= n_min
+        N = 1
+        while N < n_min:
+            N *= 2
+        return N
+
+    @staticmethod
     def from_cube(
         half: float,
-        resolution: int = 64,
-        padding: float = 0.05,
+        r_sphere: float,
+        workspace: float,
+        resolution: int = None,
+        smooth: bool = False,
+        sharpness: float = 50.0,
         device: torch.device = torch.device('cpu'),
         dtype: torch.dtype = torch.float64,
     ) -> 'SDFGrid':
         """
         Build SDF grid from analytical cube SDF in body frame.
 
-        The grid covers [-bounds, +bounds]^3 where bounds = half + padding,
-        so there is a margin outside the cube surface for smooth gradients.
+        The grid covers [-workspace, +workspace]^3 in body frame.
+        workspace should be the physical extent of the space the sphere
+        can reach — the SDF does not need to know the trajectory, only
+        the reachable space.
+
+        Resolution is auto-computed so that cell size < r_sphere (the
+        smallest feature that matters for contact detection).  Pass an
+        explicit resolution to override.
 
         Args:
-            half:       cube half-side length
-            resolution: grid resolution N (N^3 cells)
-            padding:    extra margin beyond cube surface
+            half:       cube half-side length [m]
+            r_sphere:   sphere radius [m]  (sets precision requirement)
+            workspace:  half-extent of grid in each body-frame axis [m]
+                        e.g. 1.0 means grid spans [-1, 1]^3
+            resolution: grid resolution N (N^3 cells); auto if None
+            smooth:     if True, apply analytic smoothing at edges/corners
+                        (3D extension of 2D _sdf_box_smoothed approach)
+            sharpness:  smoothing sharpness — currently unused in analytic
+                        smooth (reserved for future face-blending normal)
             device:     torch device
             dtype:      torch dtype
         """
-        bounds = half + padding
-        coords = torch.linspace(-bounds, bounds, resolution, dtype=dtype, device=device)
+        if resolution is None:
+            resolution = SDFGrid._auto_resolution(workspace, r_sphere)
 
-        # Meshgrid: (N, N, N, 3)
+        cell_size = 2.0 * workspace / (resolution - 1)
+        print(f"[SDFGrid] workspace={workspace:.3f}m  r_sphere={r_sphere:.4f}m  "
+              f"N={resolution}  cell_size={cell_size*1000:.2f}mm  "
+              f"({cell_size/r_sphere*100:.1f}% of r_sphere)")
+
+        bounds = workspace
+
+        # Build grid on CPU — avoids OOM on CUDA for large grids
+        cpu = torch.device('cpu')
+        coords = torch.linspace(-bounds, bounds, resolution, dtype=dtype, device=cpu)
+
         gz, gy, gx = torch.meshgrid(coords, coords, coords, indexing='ij')
         pts = torch.stack([gx, gy, gz], dim=-1)  # (N, N, N, 3)
 
-        # Analytical cube SDF (exact, no smoothing needed for offline grid)
-        # d_i = |p_i| - half  per axis
-        d = pts.abs() - half                              # (N, N, N, 3)
-        outside = d.clamp(min=0.0)
-        phi = outside.norm(dim=-1) + d.max(dim=-1).values.clamp(max=0.0)
-        # phi > 0 outside, phi < 0 inside, phi = 0 on surface
+        if smooth:
+            phi = SDFGrid._smooth_cube_sdf(pts, half)
+            print(f"[SDFGrid]   SDF mode: smooth(sharpness={sharpness})")
+        else:
+            d = pts.abs() - half
+            outside = d.clamp(min=0.0)
+            phi = outside.norm(dim=-1) + d.max(dim=-1).values.clamp(max=0.0)
+            print(f"[SDFGrid]   SDF mode: sharp")
 
+        phi = phi.to(device=device)
         return SDFGrid(phi_grid=phi, bounds=bounds, resolution=resolution)
+
+    @staticmethod
+    def _smooth_cube_sdf(pts: torch.Tensor, half: float) -> torch.Tensor:
+        """
+        Analytic smoothed cube SDF. Mirrors 2D _sdf_box_smoothed exactly:
+          d_i = smooth_abs(p_i) - half
+          phi = ||max(d, 0)|| + smooth_max(dx, dy, dz).clamp(max=0)
+
+        Uses eps=1e-6 for smoothing (same as 2D).
+        """
+        eps = 1e-6
+
+        def smooth_abs(x):
+            return torch.sqrt(x * x + eps * eps)
+
+        def smooth_relu(x):
+            return 0.5 * (x + torch.sqrt(x * x + eps * eps))
+
+        def smooth_max2(a, b):
+            return 0.5 * (a + b + torch.sqrt((a - b) ** 2 + eps * eps))
+
+        dx = smooth_abs(pts[..., 0]) - half
+        dy = smooth_abs(pts[..., 1]) - half
+        dz = smooth_abs(pts[..., 2]) - half
+
+        ox = smooth_relu(dx)
+        oy = smooth_relu(dy)
+        oz = smooth_relu(dz)
+        phi_outside = torch.sqrt(ox * ox + oy * oy + oz * oz + eps * eps)
+
+        m = smooth_max2(smooth_max2(dx, dy), dz)
+        phi_inside = -smooth_relu(-m)
+
+        return phi_outside + phi_inside
 
     @staticmethod
     def from_mesh(
         mesh_path: str,
-        resolution: int = 64,
-        padding: float = 0.05,
+        r_sphere: float,
+        workspace: float,
+        resolution: int = None,
         device: torch.device = torch.device('cpu'),
         dtype: torch.dtype = torch.float64,
     ) -> 'SDFGrid':
@@ -378,18 +457,97 @@ def cube_sphere_contact(
     n_world = R.to(dt) @ n_body.to(dt)
     n_world = n_world / (torch.linalg.norm(n_world) + 1e-8)
 
-    t1_world, t2_world = tangent_frame(n_world)
-
     # Closest point on cube surface in world frame
     cp_world = p_sphere - phi_raw.detach().to(dt) * n_world
+    r_cp = cp_world - p_cube
+
+    # Flip normal to match 2D obb_contact_blend2 convention:
+    # normal points sphere→cube (inward).
+    # Without flip: n=[+1,0,0] for sphere at +x → force +x on cube (wrong)
+    # With flip:    n=[-1,0,0] for sphere at +x → force -x on cube (correct)
+    n_contact = -n_world
+    t1_contact, t2_contact = tangent_frame(n_contact)
+
+    return CubeContact3D(
+        phi=phi,
+        cp_world=cp_world,
+        normal=n_contact,
+        tangent1=t1_contact,
+        tangent2=t2_contact,
+        r_cp=r_cp,
+    )
+
+
+def cube_ground_contact(
+    q_pose: torch.Tensor,
+    half: float,
+    ground_z: float = 0.0,
+    sharpness: float = 80.0,
+) -> CubeContact3D:
+    """
+    Analytic cube-vs-ground contact using a soft minimum over cube vertices.
+
+    This avoids a second SDF.  The contact point is a differentiable weighted
+    average of the lowest cube vertices, and the contact normal points upward
+    so positive normal force pushes the cube away from the ground.
+    """
+    p_cube = q_pose[:3]
+    q_rot = q_pose[3:]
+    R = quat_to_rot(q_rot)
+    h = q_pose.new_tensor(half)
+
+    vals = [-1.0, 1.0]
+    verts_local = torch.stack([
+        torch.stack([h * q_pose.new_tensor(x),
+                     h * q_pose.new_tensor(y),
+                     h * q_pose.new_tensor(z)])
+        for x in vals for y in vals for z in vals
+    ])
+    verts_world = p_cube + verts_local @ R.T
+    z_vals = verts_world[:, 2]
+
+    weights = torch.softmax(-q_pose.new_tensor(sharpness) * z_vals, dim=0)
+    cp_world = torch.sum(weights[:, None] * verts_world, dim=0)
+    phi = torch.dot(weights, z_vals) - q_pose.new_tensor(ground_z)
+
+    normal = torch.tensor([0.0, 0.0, 1.0], dtype=q_pose.dtype, device=q_pose.device)
+    tangent1 = torch.tensor([1.0, 0.0, 0.0], dtype=q_pose.dtype, device=q_pose.device)
+    tangent2 = torch.tensor([0.0, 1.0, 0.0], dtype=q_pose.dtype, device=q_pose.device)
     r_cp = cp_world - p_cube
 
     return CubeContact3D(
         phi=phi,
         cp_world=cp_world,
-        normal=n_world,
-        tangent1=t1_world,
-        tangent2=t2_world,
+        normal=normal,
+        tangent1=tangent1,
+        tangent2=tangent2,
+        r_cp=r_cp,
+    )
+
+
+def sphere_ground_contact(
+    p_sphere: torch.Tensor,
+    r_sphere: float,
+    ground_z: float = 0.0,
+) -> CubeContact3D:
+    """Analytic sphere-vs-ground contact with upward normal."""
+    normal = torch.tensor([0.0, 0.0, 1.0], dtype=p_sphere.dtype, device=p_sphere.device)
+    tangent1 = torch.tensor([1.0, 0.0, 0.0], dtype=p_sphere.dtype, device=p_sphere.device)
+    tangent2 = torch.tensor([0.0, 1.0, 0.0], dtype=p_sphere.dtype, device=p_sphere.device)
+    cp_world = torch.stack([
+        p_sphere[0],
+        p_sphere[1],
+        p_sphere.new_tensor(ground_z),
+    ])
+    phi = p_sphere[2] - p_sphere.new_tensor(r_sphere + ground_z)
+    r_cp = cp_world - p_sphere
+
+    return CubeContact3D(
+        phi=phi,
+        cp_world=cp_world,
+        normal=normal,
+        tangent1=tangent1,
+        tangent2=tangent2,
         r_cp=r_cp,
     )
 
